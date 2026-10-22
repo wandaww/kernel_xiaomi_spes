@@ -5,6 +5,22 @@
 
 #include "ss/policydb.h"
 
+#include <linux/version.h>
+
+/*
+ * FinaSU targets >= 5.10, where struct selinux_policy exists. Kernel 4.19 keeps policydb and
+ * sidtab inside selinux_state.ss, so provide a holder with the same field names. It is only
+ * ever filled with private copies (ksu_dup_sepolicy), never aliased to the live policy.
+ */
+struct sidtab;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+struct selinux_policy {
+    struct sidtab *sidtab;
+    struct policydb policydb;
+    u32 latest_granting;
+};
+#endif
+
 struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol);
 
 void ksu_destroy_sepolicy(struct selinux_policy *orig);

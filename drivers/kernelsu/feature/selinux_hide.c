@@ -32,6 +32,20 @@
 #include "ksu.h"
 #include "policy/feature.h"
 #include "hook/lsm_hook.h"
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+/* 4.19 SELinux layout; the original FinaSU code is written for >= 5.10 */
+#include <linux/flex_array.h>
+#define KSU_STATUS_LOCK (selinux_state.ss->status_lock)
+#define KSU_STATUS_PAGE (selinux_state.ss->status_page)
+#define KSU_TYPE_DATUM(db, i) ((struct type_datum *)flex_array_get_ptr((db)->type_val_to_struct_array, (i)))
+#define KSU_TYPE_ATTR_MAP(db, i) ((struct ebitmap *)flex_array_get((db)->type_attr_map_array, (i)))
+#else
+#define KSU_STATUS_LOCK (selinux_state.status_lock)
+#define KSU_STATUS_PAGE (selinux_state.status_page)
+#define KSU_TYPE_DATUM(db, i) ((db)->type_val_to_struct[(i)])
+#define KSU_TYPE_ATTR_MAP(db, i) (&(db)->type_attr_map_array[(i)])
+#endif
+
 
 static DEFINE_MUTEX(selinux_hide_mutex);
 static bool ksu_selinux_hide_enabled __read_mostly = false;
@@ -276,15 +290,15 @@ static struct page *fake_status = NULL;
 
 static void initialize_fake_status()
 {
-    mutex_lock(&selinux_state.status_lock);
+    mutex_lock(&KSU_STATUS_LOCK);
     if (fake_status)
         goto out;
-    if (!selinux_state.status_page) {
+    if (!KSU_STATUS_PAGE) {
         pr_warn("initialize_fake_status: status_page not exist\n");
         goto out;
     }
 
-    struct selinux_kernel_status *status = page_address(selinux_state.status_page);
+    struct selinux_kernel_status *status = page_address(KSU_STATUS_PAGE);
     if (!status->enforcing && !ksu_late_loaded) {
         pr_warn("initialize_fake_status: skip not enforcing\n");
         goto out;
@@ -320,7 +334,7 @@ static void initialize_fake_status()
             new_status->policyload, new_status->enforcing);
 
 out:
-    mutex_unlock(&selinux_state.status_lock);
+    mutex_unlock(&KSU_STATUS_LOCK);
 }
 
 typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
@@ -329,9 +343,9 @@ static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
 {
     if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
         void *data;
-        mutex_lock(&selinux_state.status_lock);
+        mutex_lock(&KSU_STATUS_LOCK);
         data = fake_status;
-        mutex_unlock(&selinux_state.status_lock);
+        mutex_unlock(&KSU_STATUS_LOCK);
         if (data) {
             filp->private_data = data;
             return 0;
@@ -539,11 +553,11 @@ void __exit ksu_selinux_hide_exit()
     }
     mutex_unlock(&selinux_hide_mutex);
     ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
-    mutex_lock(&selinux_state.status_lock);
+    mutex_lock(&KSU_STATUS_LOCK);
     if (fake_status)
         __free_page(fake_status);
     fake_status = NULL;
-    mutex_unlock(&selinux_state.status_lock);
+    mutex_unlock(&KSU_STATUS_LOCK);
 }
 
 void ksu_selinux_hide_drop_backup_if_unused()
@@ -776,6 +790,7 @@ static int context_struct_to_string(struct policydb *p, struct context *context,
     return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
 static int sidtab_entry_to_string(struct policydb *p, struct sidtab *sidtab, struct sidtab_entry *entry,
                                   char **scontext, u32 *scontext_len)
 {
@@ -822,6 +837,26 @@ out_unlock:
     return rc;
 }
 
+#else
+/* 4.19: no sidtab_entry and no string cache; sidtab_search() returns the context directly */
+static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+                                               u32 *scontext_len)
+{
+    struct context *context;
+
+    if (scontext)
+        *scontext = NULL;
+    *scontext_len = 0;
+
+    context = sidtab_search(policy->sidtab, sid);
+    if (!context) {
+        pr_err("SELinux: %s:  unrecognized SID %d\n", __func__, sid);
+        return -EINVAL;
+    }
+    return context_struct_to_string(&policy->policydb, context, scontext, scontext_len);
+}
+#endif
+
 static void avd_init(struct selinux_policy *policy, struct av_decision *avd)
 {
     avd->allowed = 0;
@@ -851,13 +886,13 @@ static void __nocfi type_attribute_bounds_av(struct policydb *policydb, struct c
     struct type_datum *target;
     u32 masked = 0;
 
-    source = policydb->type_val_to_struct[scontext->type - 1];
+    source = KSU_TYPE_DATUM(policydb, scontext->type - 1);
     BUG_ON(!source);
 
     if (!source->bounds)
         return;
 
-    target = policydb->type_val_to_struct[tcontext->type - 1];
+    target = KSU_TYPE_DATUM(policydb, tcontext->type - 1);
     BUG_ON(!target);
 
     memset(&lo_avd, 0, sizeof(lo_avd));
@@ -1102,8 +1137,8 @@ static void context_struct_compute_av(struct policydb *policydb, struct context 
      */
     avkey.target_class = tclass;
     avkey.specified = AVTAB_AV | AVTAB_XPERMS;
-    sattr = &policydb->type_attr_map_array[scontext->type - 1];
-    tattr = &policydb->type_attr_map_array[tcontext->type - 1];
+    sattr = KSU_TYPE_ATTR_MAP(policydb, scontext->type - 1);
+    tattr = KSU_TYPE_ATTR_MAP(policydb, tcontext->type - 1);
     ebitmap_for_each_positive_bit(sattr, snode, i)
     {
         ebitmap_for_each_positive_bit(tattr, tnode, j)
