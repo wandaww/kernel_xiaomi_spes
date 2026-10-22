@@ -45,6 +45,15 @@
 #define KSU_TYPE_DATUM(db, i) ((db)->type_val_to_struct[(i)])
 #define KSU_TYPE_ATTR_MAP(db, i) (&(db)->type_attr_map_array[(i)])
 #endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#define KSU_SYMTAB_SEARCH(s, k) hashtab_search((s)->table, (k))
+#define KSU_ORIG_DB(p) ((void)(p), &selinux_state.ss->policydb)
+#define KSU_ORIG_SIDTAB(p) ((void)(p), selinux_state.ss->sidtab)
+#else
+#define KSU_SYMTAB_SEARCH(s, k) symtab_search((s), (k))
+#define KSU_ORIG_DB(p) (&(p)->policydb)
+#define KSU_ORIG_SIDTAB(p) ((p)->sidtab)
+#endif
 
 
 static DEFINE_MUTEX(selinux_hide_mutex);
@@ -608,8 +617,8 @@ static int string_to_context_struct(struct policydb *pol, struct policydb *orig_
 
     *orig_p++ = *p++ = 0;
 
-    usrdatum = symtab_search(&pol->p_users, scontextp);
-    orig_usrdatum = symtab_search(&orig_pol->p_users, orig_scontextp);
+    usrdatum = KSU_SYMTAB_SEARCH(&pol->p_users, scontextp);
+    orig_usrdatum = KSU_SYMTAB_SEARCH(&orig_pol->p_users, orig_scontextp);
     if (!usrdatum)
         goto out;
 
@@ -630,8 +639,8 @@ static int string_to_context_struct(struct policydb *pol, struct policydb *orig_
 
     *orig_p++ = *p++ = 0;
 
-    role = symtab_search(&pol->p_roles, scontextp);
-    orig_role = symtab_search(&orig_pol->p_roles, orig_scontextp);
+    role = KSU_SYMTAB_SEARCH(&pol->p_roles, scontextp);
+    orig_role = KSU_SYMTAB_SEARCH(&orig_pol->p_roles, orig_scontextp);
     if (!role)
         goto out;
     ctx->role = role->value;
@@ -648,8 +657,8 @@ static int string_to_context_struct(struct policydb *pol, struct policydb *orig_
     oldc = *p;
     *orig_p++ = *p++ = 0;
 
-    typdatum = symtab_search(&pol->p_types, scontextp);
-    orig_typdatum = symtab_search(&orig_pol->p_types, orig_scontextp);
+    typdatum = KSU_SYMTAB_SEARCH(&pol->p_types, scontextp);
+    orig_typdatum = KSU_SYMTAB_SEARCH(&orig_pol->p_types, orig_scontextp);
     if (!typdatum || typdatum->attribute)
         goto out;
 
@@ -713,9 +722,13 @@ static int security_context_to_sid_with_policy(struct selinux_policy *policy, co
         *orig_sid_p = SECSID_NULL;
 
     // removed: if (force)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
     rcu_read_lock();
     orig_policy = rcu_dereference(selinux_state.policy);
-    rc = string_to_context_struct(&policy->policydb, &orig_policy->policydb, policy->sidtab, orig_policy->sidtab,
+#else
+    read_lock(&selinux_state.ss->policy_rwlock);
+#endif
+    rc = string_to_context_struct(&policy->policydb, KSU_ORIG_DB(orig_policy), policy->sidtab, KSU_ORIG_SIDTAB(orig_policy),
                                   scontext2, scontext3, &context, &orig_context, def_sid, &orig_rc);
     if (!rc) {
         rc = sidtab_context_to_sid(policy->sidtab, &context, sid);
@@ -724,12 +737,16 @@ static int security_context_to_sid_with_policy(struct selinux_policy *policy, co
     // Each successfully parsed context owns resources, even if the other
     // policy rejected it. Sync independently and release both contexts.
     if (!orig_rc) {
-        orig_rc = sidtab_context_to_sid(orig_policy->sidtab, &orig_context, &orig_sid);
+        orig_rc = sidtab_context_to_sid(KSU_ORIG_SIDTAB(orig_policy), &orig_context, &orig_sid);
         if (!orig_rc && orig_sid_p)
             *orig_sid_p = orig_sid;
         context_destroy(&orig_context);
     }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
     rcu_read_unlock();
+#else
+    read_unlock(&selinux_state.ss->policy_rwlock);
+#endif
     if (orig_rc_p)
         *orig_rc_p = orig_rc;
     kfree(scontext3);
