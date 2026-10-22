@@ -12,7 +12,9 @@
 
 #include "../sys.h"
 
+#if __has_include(<linux/mount.h>)
 #include <linux/mount.h>
+#endif
 
 /*
  * int mount(const char *source, const char *target,
