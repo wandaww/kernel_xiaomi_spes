@@ -144,6 +144,8 @@ static int __init ksu_find_ni_syscall_slots(int *out_slots, int max_slots)
 // otherwise it's a spurious call — return -ENOSYS.
 static long __nocfi ksu_syscall_dispatcher(const struct pt_regs *regs)
 {
+    long ret = -ENOSYS;
+
     if (regs->syscallno != ksu_dispatcher_nr)
         return -ENOSYS;
 
@@ -159,10 +161,10 @@ static long __nocfi ksu_syscall_dispatcher(const struct pt_regs *regs)
     if (likely(orig_nr >= 0 && orig_nr < __NR_syscalls)) {
         ksu_syscall_hook_fn fn = READ_ONCE(syscall_hooks[orig_nr]);
         if (likely(fn))
-            return fn(orig_nr, regs);
+            ret = fn(orig_nr, regs);
     }
 
-    return -ENOSYS;
+    return ret;
 }
 
 // Register a handler into the dispatcher's routing table.
@@ -217,6 +219,16 @@ void __init ksu_syscall_hook_init(void)
 
     ksu_dispatcher_nr = ni_slot;
     ksu_syscall_table_hook(ksu_dispatcher_nr, (syscall_fn_t)ksu_syscall_dispatcher, NULL);
+    /*
+     * ksu_syscall_table_hook() ignores a failed patch. If the slot still holds sys_ni_syscall,
+     * every redirected syscall would return -ENOSYS (and PID 1 is marked early), so keep the
+     * dispatcher only when the table really points at it.
+     */
+    if (READ_ONCE(ksu_syscall_table[ni_slot]) != (syscall_fn_t)ksu_syscall_dispatcher) {
+        pr_err("dispatcher patch at slot %d did not take effect, syscall redirection disabled\n", ni_slot);
+        ksu_dispatcher_nr = -1;
+        return;
+    }
     pr_info("dispatcher installed at slot %d\n", ksu_dispatcher_nr);
 }
 
