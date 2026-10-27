@@ -2,21 +2,20 @@
 #define __KSU_H_APK_V2_SIGN
 
 #include <linux/types.h>
+#include <linux/compiler.h>
 
-#define APK_SIGN_FLAG_TRUSTED 0x1
-
-struct apk_sign_match {
-    int index; /* matched table index, -1 for a dynamic/unmatched signature */
-    bool trusted; /* the signature is authorized to be a manager */
-    bool preset; /* a recognized known-manager signature that is not trusted */
-    bool dynamic; /* matched a user-added dynamic manager signature */
-    u32 size; /* certificate size */
-    char hash[65]; /* lowercase hex SHA-256 of the certificate */
-    const char *name; /* human readable manager name, may be NULL */
+enum ksu_manager_type {
+	KSU_MANAGER_UNKNOWN = 0,
+	KSU_MANAGER_KSUN,
+	KSU_MANAGER_BKSU,
+	KSU_MANAGER_XXSU,
 };
 
 bool is_manager_apk(char *path);
-bool match_apk_signature(char *path, struct apk_sign_match *match);
-int get_pkg_from_apk_path(char *pkg, const char *path);
+enum ksu_manager_type ksu_detect_manager_apk(char *path);
+void ksu_set_manager_type(enum ksu_manager_type type);
+u32 ksu_get_manager_version(void);
+const char *ksu_get_manager_version_tag(void);
+int get_pkg_from_apk_dir_path(char *pkg, const char *path);
 
 #endif

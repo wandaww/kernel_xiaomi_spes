@@ -27,6 +27,7 @@
 #include <linux/task_work.h>
 #include <linux/sched/task.h>
 #include <linux/fs_context.h>
+#include <linux/susfs_def.h>
 
 #include "pnode.h"
 #include "internal.h"
@@ -109,6 +110,10 @@ static int mnt_alloc_id(struct mount *mnt)
 
 static void mnt_free_id(struct mount *mnt)
 {
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	if (mnt->mnt.mnt_flags & VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT)
+		return;
+#endif
 	ida_free(&mnt_id_ida, mnt->mnt_id);
 }
 
@@ -3682,3 +3687,71 @@ const struct proc_ns_operations mntns_operations = {
 	.install	= mntns_install,
 	.owner		= mntns_owner,
 };
+
+
+#ifdef CONFIG_KSU_SUSFS
+/*
+ * Return the first non-SUS mount ID found while walking toward
+ * the root of the mount tree.
+ */
+int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt)
+{
+	struct mount *mnt = orig_mnt;
+	int mnt_id;
+
+	if (!mnt)
+		return 0;
+
+	lock_mount_hash();
+	for (; mnt && mnt->mnt_parent &&
+	       mnt != mnt->mnt_parent &&
+	       mnt->mnt_id >= DEFAULT_KSU_MNT_ID;
+	     mnt = mnt->mnt_parent)
+		;
+
+	mnt_id = mnt ? mnt->mnt_id : 0;
+	unlock_mount_hash();
+
+	return mnt_id;
+}
+
+/*
+ * Resolve a SUS mount to its first non-SUS ancestor.
+ * The returned mount and its root dentry each hold a reference.
+ */
+struct vfsmount *
+susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt)
+{
+	struct mount *mnt;
+
+	if (!vfsmnt)
+		return NULL;
+
+	mnt = real_mount(vfsmnt);
+
+	lock_mount_hash();
+	for (; mnt && mnt->mnt_parent &&
+	       mnt != mnt->mnt_parent &&
+	       mnt->mnt_id >= DEFAULT_KSU_MNT_ID;
+	     mnt = mnt->mnt_parent)
+		;
+
+	if (!mnt) {
+		unlock_mount_hash();
+		return vfsmnt;
+	}
+
+	mntget(&mnt->mnt);
+	if (!mnt->mnt.mnt_root ||
+	    IS_ERR(mnt->mnt.mnt_root)) {
+		mntput(&mnt->mnt);
+		unlock_mount_hash();
+		return vfsmnt;
+	}
+
+	dget(mnt->mnt.mnt_root);
+	unlock_mount_hash();
+
+	return &mnt->mnt;
+}
+#endif /* CONFIG_KSU_SUSFS */

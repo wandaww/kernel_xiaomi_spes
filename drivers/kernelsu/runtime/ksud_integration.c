@@ -1,188 +1,42 @@
-#include "feature/selinux_hide.h"
-#include <linux/rcupdate.h>
-#include <linux/slab.h>
-#include <linux/mm.h>
-#include <asm/current.h>
-#include <linux/compat.h>
-#include <linux/cred.h>
-#include <linux/dcache.h>
-#include <linux/err.h>
-#include <linux/file.h>
-#include <linux/fs.h>
-#include <linux/version.h>
-#include <linux/input-event-codes.h>
-#include <linux/kprobes.h>
-#include <linux/printk.h>
-#include <linux/types.h>
-#include <linux/uaccess.h>
-#include <linux/namei.h>
-#include <linux/workqueue.h>
-#include <linux/uio.h>
-#include <linux/stat.h>
-
-#include "arch.h"
-#include "klog.h" // IWYU pragma: keep
-#include "ksu.h"
-#include "runtime/ksud.h"
-#include "runtime/ksud_boot.h"
-#include "policy/feature.h"
-#include "selinux/selinux.h"
-#include "hook/syscall_hook.h"
-#include "hook/syscall_event_bridge.h"
-#include "preinit/preinit.h"
-
-// clang-format off
 static const char KERNEL_SU_RC[] =
-    "\n"
-    "on post-fs-data\n"
-    "    start logd\n"
-    // We should wait for the post-fs-data finish
-    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " post-fs-data\n"
-    "\n"
-    "on nonencrypted\n"
-    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " services\n"
-    "\n"
-    "on property:vold.decrypt=trigger_restart_framework\n"
-    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " services\n"
-    "\n"
-    "on property:sys.boot_completed=1\n"
-    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " boot-completed\n"
-    "\n"
-    "\n";
-// clang-format on
+	"\n"
+
+	"on post-fs-data\n"
+	"    start logd\n"
+	// We should wait for the post-fs-data finish
+	"    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " post-fs-data\n"
+	"\n"
+
+	"on nonencrypted\n"
+	"    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " services\n"
+	"\n"
+
+	"on property:vold.decrypt=trigger_restart_framework\n"
+	"    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " services\n"
+	"\n"
+
+	"on property:sys.boot_completed=1\n"
+	"    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " boot-completed\n"
+	"\n"
+
+	"\n";
 
 static void stop_init_rc_hook();
-static void stop_execve_hook();
 
-static struct work_struct stop_input_hook_work;
+static bool ksu_vfs_read_hook __read_mostly = true;
+static bool ksu_input_hook __read_mostly = true;
 
-#define MAX_ARG_STRINGS 0x7FFFFFFF
-struct user_arg_ptr {
-#ifdef CONFIG_COMPAT
-    bool is_compat;
+#ifdef KSU_CAN_USE_JUMP_LABEL
+DEFINE_STATIC_KEY_TRUE(ksud_vfs_read_key);
+static inline void ksu_disable_vfs_read_branch()
+{
+	pr_info("vfs_read_hook: remove vfs_read branches\n");
+	static_branch_disable(&ksud_vfs_read_key);
+	smp_mb();
+}
+#else
+#define ksu_disable_vfs_read_branch() do { } while (0)
 #endif
-    union {
-        const char __user *const __user *native;
-#ifdef CONFIG_COMPAT
-        const compat_uptr_t __user *compat;
-#endif
-    } ptr;
-};
-
-static const char __user *get_user_arg_ptr(struct user_arg_ptr argv, int nr)
-{
-    const char __user *native;
-
-#ifdef CONFIG_COMPAT
-    if (unlikely(argv.is_compat)) {
-        compat_uptr_t compat;
-
-        if (get_user(compat, argv.ptr.compat + nr))
-            return ERR_PTR(-EFAULT);
-
-        return compat_ptr(compat);
-    }
-#endif
-
-    if (get_user(native, argv.ptr.native + nr))
-        return ERR_PTR(-EFAULT);
-
-    return native;
-}
-
-/*
- * count() counts the number of strings in array ARGV.
- */
-
-/*
- * Make sure old GCC compiler can use __maybe_unused,
- * Test passed in 4.4.x ~ 4.9.x when use GCC.
- */
-
-static int __maybe_unused count(struct user_arg_ptr argv, int max)
-{
-    int i = 0;
-
-    if (argv.ptr.native != NULL) {
-        for (;;) {
-            const char __user *p = get_user_arg_ptr(argv, i);
-
-            if (!p)
-                break;
-
-            if (IS_ERR(p))
-                return -EFAULT;
-
-            if (i >= max)
-                return -E2BIG;
-            ++i;
-
-            if (fatal_signal_pending(current))
-                return -ERESTARTNOHAND;
-        }
-    }
-    return i;
-}
-
-static bool check_argv(struct user_arg_ptr argv, int index, const char *expected, char *buf, size_t buf_len)
-{
-    const char __user *p;
-    int argc;
-
-    argc = count(argv, MAX_ARG_STRINGS);
-    if (argc <= index)
-        return false;
-
-    p = get_user_arg_ptr(argv, index);
-    if (!p || IS_ERR(p))
-        goto fail;
-
-    if (strncpy_from_user_nofault(buf, p, buf_len) <= 0)
-        goto fail;
-
-    buf[buf_len - 1] = '\0';
-    return !strcmp(buf, expected);
-
-fail:
-    pr_err("check_argv failed\n");
-    return false;
-}
-
-void ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv)
-{
-    static const char app_process[] = "/system/bin/app_process";
-    static bool first_zygote = true;
-
-    /* This applies to versions Android 10+ */
-    static const char system_bin_init[] = "/system/bin/init";
-    static bool init_second_stage_executed = false;
-
-    // https://cs.android.com/android/platform/superproject/+/android-16.0.0_r2:system/core/init/main.cpp;l=77
-    if (unlikely(!memcmp(path, system_bin_init, sizeof(system_bin_init) - 1) && argv)) {
-        char buf[16];
-        if (!init_second_stage_executed && check_argv(*argv, 1, "second_stage", buf, sizeof(buf))) {
-            pr_info("/system/bin/init second_stage executed\n");
-            ksu_preinit_release();
-            ksu_selinux_hide_handle_second_stage();
-            apply_kernelsu_rules();
-            cache_sid();
-            setup_ksu_cred();
-            ksu_feature_apply_forced();
-            init_second_stage_executed = true;
-        }
-    }
-
-    if (unlikely(first_zygote && !memcmp(path, app_process, sizeof(app_process) - 1) && argv)) {
-        char buf[16];
-        if (check_argv(*argv, 1, "-Xzygote", buf, sizeof(buf))) {
-            pr_info("exec zygote, /data prepared, second_stage: %d\n", init_second_stage_executed);
-            ksu_preinit_release();
-            on_post_fs_data();
-            first_zygote = false;
-            ksu_stop_ksud_execve_hook();
-        }
-    }
-}
 
 static ssize_t (*orig_read)(struct file *, char __user *, size_t, loff_t *);
 static ssize_t (*orig_read_iter)(struct kiocb *, struct iov_iter *);
@@ -190,102 +44,131 @@ static struct file_operations fops_proxy;
 static ssize_t ksu_rc_pos = 0;
 const size_t ksu_rc_len = sizeof(KERNEL_SU_RC) - 1;
 
-// Prefer /metadata/watchdog/ when present, else /metadata.
-#define MODULE_RC_PATH_WATCHDOG "/metadata/watchdog/ksu/modules.rc"
+// Prefer /metadata/vold, else /metadata/watchdog, else /metadata.
 #define MODULE_RC_PATH_VOLD "/metadata/vold/ksu/modules.rc"
+#define MODULE_RC_PATH_WATCHDOG "/metadata/watchdog/ksu/modules.rc"
 #define MODULE_RC_PATH_DEFAULT "/metadata/ksu/modules.rc"
+#define MODULE_RC_MAX (1u << 20) /* 1 MiB cap */
 static char *module_rc_buf;
-static size_t module_rc_len;
+static size_t module_rc_len = 0;
 static ssize_t module_rc_pos;
 
 static struct file *open_module_rc(const char **chosen_path)
 {
-    struct file *f = filp_open(MODULE_RC_PATH_VOLD, O_RDONLY, 0);
-    if (!IS_ERR(f)) {
-        *chosen_path = MODULE_RC_PATH_VOLD;
-        return f;
-    }
-    f = filp_open(MODULE_RC_PATH_WATCHDOG, O_RDONLY, 0);
-    if (!IS_ERR(f)) {
-        *chosen_path = MODULE_RC_PATH_WATCHDOG;
-        return f;
-    }
-    f = filp_open(MODULE_RC_PATH_DEFAULT, O_RDONLY, 0);
-    if (!IS_ERR(f)) {
-        *chosen_path = MODULE_RC_PATH_DEFAULT;
-        return f;
-    }
-    *chosen_path = MODULE_RC_PATH_DEFAULT;
-    return f;
+	struct file *f = filp_open(MODULE_RC_PATH_VOLD, O_RDONLY, 0);
+	if (!IS_ERR(f)) {
+		*chosen_path = MODULE_RC_PATH_VOLD;
+		return f;
+	}
+	f = filp_open(MODULE_RC_PATH_WATCHDOG, O_RDONLY, 0);
+	if (!IS_ERR(f)) {
+		*chosen_path = MODULE_RC_PATH_WATCHDOG;
+		return f;
+	}
+	f = filp_open(MODULE_RC_PATH_DEFAULT, O_RDONLY, 0);
+	if (!IS_ERR(f)) {
+		*chosen_path = MODULE_RC_PATH_DEFAULT;
+		return f;
+	}
+	*chosen_path = MODULE_RC_PATH_DEFAULT;
+	return f;
 }
 
 static void load_module_rc_once(void)
 {
-    static bool loaded = false;
-    struct file *f;
-    const char *path = NULL;
-    loff_t pos = 0;
-    ssize_t r;
-    size_t fsize;
-    const struct cred *old_cred;
+	static bool loaded = false;
+	struct file *f;
+	const char *path = NULL;
+	loff_t pos = 0;
+	ssize_t r;
+	size_t fsize;
+	const struct cred *old_cred;
 
-    if (loaded)
-        return;
-    loaded = true;
-    if (ksu_no_custom_rc) {
-        pr_info("custom rc is disabled\n");
-        return;
-    }
+	if (loaded)
+		return;
+	loaded = true;
+ 
+	old_cred = override_creds(ksu_cred);
 
-    old_cred = override_creds(ksu_cred);
+	f = open_module_rc(&path);
+	if (IS_ERR(f)) {
+		pr_info("module rc: open %s failed: %ld\n", path, PTR_ERR(f));
+		goto out_revert_creds;
+	}
 
-    f = open_module_rc(&path);
-    if (IS_ERR(f)) {
-        pr_info("module rc: open %s failed: %ld\n", path, PTR_ERR(f));
-        goto out_revert_creds;
-    }
+	if (!S_ISREG(file_inode(f)->i_mode)) {
+		pr_warn("module rc: %s is not a regular file\n", path);
+		goto out_close_file;
+	}
 
-    if (!S_ISREG(file_inode(f)->i_mode)) {
-        pr_warn("module rc: %s is not a regular file\n", path);
-        goto out_close_file;
-    }
+	fsize = i_size_read(file_inode(f));
+	if (fsize == 0) {
+		pr_warn("module rc: skip empty module rc\n");
+		goto out_close_file;
+	}
 
-    fsize = i_size_read(file_inode(f));
-    if (fsize == 0) {
-        pr_warn("module rc: skip empty module rc\n");
-        goto out_close_file;
-    }
+	module_rc_buf = kvmalloc(fsize, GFP_KERNEL);
+	if (!module_rc_buf) {
+		pr_err("module rc: alloc %zu failed\n", fsize);
+		goto out_close_file;
+	}
 
-    module_rc_buf = kvmalloc(fsize, GFP_KERNEL);
-    if (!module_rc_buf) {
-        pr_err("module rc: alloc %zu failed\n", fsize);
-        goto out_close_file;
-    }
+	r = kernel_read(f, module_rc_buf, fsize, &pos);
+ 
+	if (r <= 0) {
+		pr_err("module rc: read failed: %zd\n", r);
+		kvfree(module_rc_buf);
+		module_rc_buf = NULL;
+		goto out_close_file;
+	}
 
-    r = kernel_read(f, module_rc_buf, fsize, &pos);
-
-    if (r <= 0) {
-        pr_err("module rc: read failed: %zd\n", r);
-        kvfree(module_rc_buf);
-        module_rc_buf = NULL;
-        goto out_close_file;
-    }
-
-    module_rc_len = r;
-    pr_info("module rc: loaded %zu bytes from %s\n", module_rc_len, path);
+	module_rc_len = r;
+	pr_info("module rc: loaded %zu bytes from %s\n", module_rc_len, path);
 
 out_close_file:
-    filp_close(f, NULL);
+	filp_close(f, NULL);
 
 out_revert_creds:
-    revert_creds(old_cred);
+	revert_creds(old_cred);
 }
 
 static void free_module_rc(void)
 {
-    kvfree(module_rc_buf);
-    module_rc_buf = NULL;
-    module_rc_len = 0;
+	kvfree(module_rc_buf);
+	module_rc_buf = NULL;
+	module_rc_len = 0;
+}
+
+static noinline void set_module_rc_len_vfs()
+{
+	static bool loaded = false;
+	if (loaded)
+		return;
+
+	loaded = true;
+
+	struct path path;
+
+	int err = kern_path(MODULE_RC_PATH_VOLD, LOOKUP_FOLLOW, &path);
+	if (err)
+		err = kern_path(MODULE_RC_PATH_WATCHDOG, LOOKUP_FOLLOW, &path);
+	if (err)
+		err = kern_path(MODULE_RC_PATH_DEFAULT, LOOKUP_FOLLOW, &path);
+	if (err)
+		return; 
+
+	struct inode *inode = d_inode(path.dentry);
+	if (inode && S_ISREG(inode->i_mode))
+		module_rc_len = i_size_read(inode);
+
+	path_put(&path);
+
+	if (module_rc_len > MODULE_RC_MAX)
+		module_rc_len = MODULE_RC_MAX;
+
+	pr_info("%s: %zu\n", __func__, module_rc_len);
+
+	return;
 }
 
 // https://cs.android.com/android/platform/superproject/main/+/main:system/core/init/parser.cpp;l=144;drc=61197364367c9e404c7da6900658f1b16c42d0da
@@ -295,386 +178,515 @@ static void free_module_rc(void)
 
 static ssize_t read_proxy(struct file *file, char __user *buf, size_t count, loff_t *pos)
 {
-    ssize_t ret = 0;
-    size_t append_count;
-    if (ksu_rc_pos && ksu_rc_pos < ksu_rc_len)
-        goto append_ksu_rc;
-    if (ksu_rc_pos >= ksu_rc_len && module_rc_pos < module_rc_len)
-        goto append_module_rc;
+	ssize_t ret = 0;
+	size_t append_count;
+	if (ksu_rc_pos && ksu_rc_pos < ksu_rc_len)
+		goto append_ksu_rc;
+	if (ksu_rc_pos >= ksu_rc_len && module_rc_pos < module_rc_len)
+		goto append_module_rc;
 
-    ret = orig_read(file, buf, count, pos);
-    if (ret != 0) {
-        return ret;
-    }
-    if (ksu_rc_pos >= ksu_rc_len && module_rc_pos >= module_rc_len) {
-        return ret;
-    }
-    pr_info("read_proxy: orig read finished, start append rc\n");
+	ret = orig_read(file, buf, count, pos);
+	if (ret != 0) {
+		return ret;
+	}
+	if (ksu_rc_pos >= ksu_rc_len && module_rc_pos >= module_rc_len) {
+		return ret;
+	}
+	pr_info("read_proxy: orig read finished, start append rc\n");
 
 append_ksu_rc:
-    if (ksu_rc_pos < ksu_rc_len) {
-        append_count = ksu_rc_len - ksu_rc_pos;
-        if (append_count > count - ret)
-            append_count = count - ret;
-        // copy_to_user returns the number of bytes that could not be copied
-        if (copy_to_user(buf + ret, KERNEL_SU_RC + ksu_rc_pos, append_count)) {
-            pr_info("read_proxy: append error, totally appended %ld\n", ksu_rc_pos);
-            return ret;
-        }
-        pr_info("read_proxy: append static %zu\n", append_count);
-        ksu_rc_pos += append_count;
-        ret += append_count;
-        if (ksu_rc_pos == ksu_rc_len)
-            pr_info("read_proxy: static append done\n");
-    }
+	if (ksu_rc_pos < ksu_rc_len) {
+		append_count = ksu_rc_len - ksu_rc_pos;
+		if (append_count > count - ret)
+			append_count = count - ret;
+		// copy_to_user returns the number of bytes that could not be copied
+		if (copy_to_user(buf + ret, KERNEL_SU_RC + ksu_rc_pos, append_count)) {
+			pr_info("read_proxy: append error, totally appended %ld\n", ksu_rc_pos);
+			return ret;
+		}
+		pr_info("read_proxy: append static %zu\n", append_count);
+		ksu_rc_pos += append_count;
+		ret += append_count;
+		if (ksu_rc_pos == ksu_rc_len)
+			pr_info("read_proxy: static append done\n");
+	}
 
 append_module_rc:
-    if (module_rc_pos < module_rc_len && (size_t)ret < count) {
-        append_count = module_rc_len - module_rc_pos;
-        if (append_count > count - ret)
-            append_count = count - ret;
-        if (copy_to_user(buf + ret, module_rc_buf + module_rc_pos, append_count)) {
-            pr_info("read_proxy: module append error, totally appended %zd\n", module_rc_pos);
-            return ret;
-        }
-        pr_info("read_proxy: append module %zu\n", append_count);
-        module_rc_pos += append_count;
-        ret += append_count;
-        if (module_rc_pos == (ssize_t)module_rc_len) {
-            pr_info("read_proxy: module append done\n");
-            free_module_rc();
-        }
-    }
+	if (module_rc_pos < module_rc_len && (size_t)ret < count) {
+		append_count = module_rc_len - module_rc_pos;
+		if (append_count > count - ret)
+			append_count = count - ret;
+		if (copy_to_user(buf + ret, module_rc_buf + module_rc_pos, append_count)) {
+			pr_info("read_proxy: module append error, totally appended %zd\n", module_rc_pos);
+			return ret;
+		}
+		pr_info("read_proxy: append module %zu\n", append_count);
+		module_rc_pos += append_count;
+		ret += append_count;
+		if (module_rc_pos == (ssize_t)module_rc_len) {
+			pr_info("read_proxy: module append done\n");
+			free_module_rc();
+		}
+	}
 
-    return ret;
+	return ret;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0) || defined(KSU_HAS_FOP_READ_ITER)
 static ssize_t read_iter_proxy(struct kiocb *iocb, struct iov_iter *to)
 {
-    ssize_t ret = 0;
-    size_t append_count;
-    if (ksu_rc_pos && ksu_rc_pos < ksu_rc_len)
-        goto append_ksu_rc;
-    if (ksu_rc_pos >= ksu_rc_len && module_rc_pos < module_rc_len)
-        goto append_module_rc;
+	ssize_t ret = 0;
+	size_t append_count;
+	if (ksu_rc_pos && ksu_rc_pos < ksu_rc_len)
+		goto append_ksu_rc;
+	if (ksu_rc_pos >= ksu_rc_len && module_rc_pos < module_rc_len)
+		goto append_module_rc;
 
-    ret = orig_read_iter(iocb, to);
-    if (ret != 0) {
-        return ret;
-    }
-    if (ksu_rc_pos >= ksu_rc_len && module_rc_pos >= module_rc_len) {
-        return ret;
-    }
-    pr_info("read_iter_proxy: orig read finished, start append rc\n");
+	ret = orig_read_iter(iocb, to);
+	if (ret != 0) {
+		return ret;
+	}
+	if (ksu_rc_pos >= ksu_rc_len && module_rc_pos >= module_rc_len) {
+		return ret;
+	}
+	pr_info("read_iter_proxy: orig read finished, start append rc\n");
 
 append_ksu_rc:
-    if (ksu_rc_pos < ksu_rc_len) {
-        // copy_to_iter returns the number of bytes successfully copied
-        append_count = copy_to_iter(KERNEL_SU_RC + ksu_rc_pos, ksu_rc_len - ksu_rc_pos, to);
-        if (!append_count) {
-            pr_info("read_iter_proxy: append error, totally appended %ld\n", ksu_rc_pos);
-            return ret;
-        }
-        pr_info("read_iter_proxy: append static %zu\n", append_count);
-        ksu_rc_pos += append_count;
-        ret += append_count;
-        if (ksu_rc_pos == ksu_rc_len) {
-            pr_info("read_iter_proxy: static append done\n");
-        }
-    }
+	if (ksu_rc_pos < ksu_rc_len) {
+		// copy_to_iter returns the number of bytes successfully copied
+		append_count = copy_to_iter(KERNEL_SU_RC + ksu_rc_pos, ksu_rc_len - ksu_rc_pos, to);
+		if (!append_count) {
+			pr_info("read_iter_proxy: append error, totally appended %ld\n", ksu_rc_pos);
+			return ret;
+		}
+		pr_info("read_iter_proxy: append static %zu\n", append_count);
+		ksu_rc_pos += append_count;
+		ret += append_count;
+		if (ksu_rc_pos == ksu_rc_len) {
+			pr_info("read_iter_proxy: static append done\n");
+		}
+	}
 
 append_module_rc:
-    if (module_rc_pos < module_rc_len) {
-        append_count = copy_to_iter(module_rc_buf + module_rc_pos, module_rc_len - module_rc_pos, to);
-        if (!append_count) {
-            pr_info("read_iter_proxy: module append error, appended %zd\n", module_rc_pos);
-            return ret;
-        }
-        pr_info("read_iter_proxy: append module %zu\n", append_count);
-        module_rc_pos += append_count;
-        ret += append_count;
-        if (module_rc_pos == (ssize_t)module_rc_len) {
-            pr_info("read_iter_proxy: module append done\n");
-            free_module_rc();
-        }
-    }
-    return ret;
+	if (module_rc_pos < module_rc_len) {
+		append_count = copy_to_iter(module_rc_buf + module_rc_pos, module_rc_len - module_rc_pos, to);
+		if (!append_count) {
+			pr_info("read_iter_proxy: module append error, appended %zd\n", module_rc_pos);
+			return ret;
+		}
+		pr_info("read_iter_proxy: append module %zu\n", append_count);
+		module_rc_pos += append_count;
+		ret += append_count;
+		if (module_rc_pos == (ssize_t)module_rc_len) {
+			pr_info("read_iter_proxy: module append done\n");
+			free_module_rc();
+		}
+	}
+	return ret;
 }
+#endif
 
 static bool is_init_rc(struct file *fp)
 {
-    if (strcmp(current->comm, "init")) {
-        // we are only interest in `init` process
-        return false;
-    }
+	// we are only interested in `init-like` process
+	// catch generic_init, init
+	if (!strstr(current->comm, "init")) {
+		return false;
+	}
 
-    if (!d_is_reg(fp->f_path.dentry)) {
-        return false;
-    }
+	if (!d_is_reg(fp->f_path.dentry)) {
+		return false;
+	}
 
-    // Bind mounts retain the source dentry name, so match the mounted path.
-    char path[256];
-    char *dpath = d_path(&fp->f_path, path, sizeof(path));
+	// Bind mounts retain the source dentry name, so match the mounted path.
+	char path[256];
+	char *dpath = d_path(&fp->f_path, path, sizeof(path));
 
-    if (IS_ERR(dpath)) {
-        return false;
-    }
+	if (IS_ERR(dpath)) {
+		return false;
+	}
 
-    if (strcmp(dpath, "/system/etc/init/hw/init.rc")) {
-        return false;
-    }
+	if (!!strcmp(dpath, "/init.rc") && !!strcmp(dpath, "/system/etc/init/hw/init.rc")) {
+		return false;
+	}
 
-    return true;
+	pr_info("%s: %s \n", __func__, dpath);
+
+	return true;
 }
 
-static void ksu_install_rc_hook(struct file *file)
+static noinline void ksu_install_rc_hook(struct file *file)
 {
-    if (!is_init_rc(file)) {
-        return;
-    }
+	if (!is_init_rc(file)) {
+		return;
+	}
 
-    // we only process the first read
-    static bool rc_hooked = false;
-    if (rc_hooked) {
-        // we don't need these hooks, unregister it!
+	// we only process the first read
+	static bool rc_hooked = false;
+	if (rc_hooked) {
+		// we don't need these hooks, unregister it!
+		return;
+	}
+	rc_hooked = true;
+	stop_init_rc_hook();
 
-        return;
-    }
-    rc_hooked = true;
-    stop_init_rc_hook();
+	// since we already have domains, selinux is initialized, we can apply rules and shit
+	// https://github.com/LineageOS/android_system_core_old/blob/ecbcdafc3/init/init.cpp#L669
+	pr_info("%s: init.rc second stage, fp: 0x%lx \n", __func__, (uintptr_t)file);
+	apply_kernelsu_rules();
+	cache_sid();
+	setup_ksu_cred();
+	ksu_grab_init_session_keyring();
+	ksu_feature_apply_forced();
 
-    // now we can sure that the init process is reading
-    // `/system/etc/init/init.rc`
+	// now we can sure that the init process is reading
+	// `/system/etc/init/init.rc`
 
-    load_module_rc_once();
+	load_module_rc_once();
 
-    pr_info("read init.rc, comm: %s, rc_count: %zu, module_rc: %zu\n", current->comm, ksu_rc_len, module_rc_len);
+	pr_info("read init.rc, comm: %s, rc_count: %zu, module_rc: %zu\n", current->comm, ksu_rc_len, module_rc_len);
 
-    // Now we need to proxy the read and modify the result!
-    // But, we can not modify the file_operations directly, because it's in read-only memory.
-    // We just replace the whole file_operations with a proxy one.
-    memcpy(&fops_proxy, file->f_op, sizeof(struct file_operations));
-    orig_read = file->f_op->read;
-    if (orig_read) {
-        fops_proxy.read = read_proxy;
-    }
-    orig_read_iter = file->f_op->read_iter;
-    if (orig_read_iter) {
-        fops_proxy.read_iter = read_iter_proxy;
-    }
-    // replace the file_operations
-    file->f_op = &fops_proxy;
+	// Now we need to proxy the read and modify the result!
+	// But, we can not modify the file_operations directly, because it's in read-only memory.
+	// We just replace the whole file_operations with a proxy one.
+	memcpy(&fops_proxy, file->f_op, sizeof(struct file_operations));
+	orig_read = file->f_op->read;
+	if (orig_read) {
+		fops_proxy.read = read_proxy;
+	}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0) || defined(KSU_HAS_FOP_READ_ITER)
+	orig_read_iter = file->f_op->read_iter;
+	if (orig_read_iter) {
+		fops_proxy.read_iter = read_iter_proxy;
+	}
+#endif
+	// replace the file_operations
+	file->f_op = &fops_proxy;
+
+	return;
 }
 
-static void ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
+// for sys_read kp / syscall table
+static noinline void ksu_handle_sys_read_fd(unsigned int fd)
 {
-    struct file *file = fget(fd);
-    if (!file) {
-        return;
-    }
-    ksu_install_rc_hook(file);
-    fput(file);
+	if (likely(!ksu_vfs_read_hook))
+		return;
+
+	struct file *file = fget(fd);
+	if (!file) {
+		return;
+	}
+	ksu_install_rc_hook(file);
+	fput(file);
 }
 
-static unsigned int volumedown_pressed_count = 0;
-
-static bool is_volumedown_enough(unsigned int count)
+#define STAT_NATIVE 0
+#define STAT_STAT64 1
+static inline void ksu_common_newfstat_ret(unsigned int fd_int, void **statbuf_ptr, 
+			const int type, const char *syscall_name)
 {
-    return count >= 3;
+	struct file *file = fget(fd_int);
+	if (!file)
+		return;
+
+	if (!is_init_rc(file)) {
+		fput(file);
+		return;
+	}
+	fput(file);
+
+	uintptr_t statbuf_ptr_local = (uintptr_t)*(void **)statbuf_ptr;
+	void __user *statbuf = (void __user *)statbuf_ptr_local;
+	if (!statbuf)
+		return;
+
+	// if init process is running, try to grab module_rc length
+	// preempt check is because we are also running newfstat hook on kprobe
+	// and we really cannot kern_path on it safely
+	if (preemptible())
+		set_module_rc_len_vfs();
+
+	pr_info("%s: stat init.rc \n", syscall_name);
+
+	// we do this for kretprobe's reusability
+	// this is pretty short, so nbd
+	bool got_flipped = false;
+	if (!preemptible()) {
+		preempt_enable();
+		got_flipped = true;
+	}
+
+/**
+ * NOTE: Workaround to OABI's (likely) write-alignment issue.
+ * weirdly enough dedicated copying with offsetof causes an issue! (somehow byte 44 is misaligned?!)
+ * here we copy the whole struct, edit and write it over back!
+ */
+#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+	if (type == STAT_NATIVE)
+		goto stat_native;
+	
+	struct stat64 k_stat64;
+	if (copy_from_user_retry(&k_stat64, statbuf, sizeof(struct stat64))) {
+		pr_info("%s: read statbuf 0x%lx failed \n", syscall_name, (uintptr_t)statbuf);
+		goto out;
+	}
+
+	// take note of signed + unsigned math here (ksu_rc_len, module_rc_len are size_t)
+	// st_size is signed long long
+	long long stat64_old_size = (long long)k_stat64.st_size;
+	long long stat64_new_size = stat64_old_size + (long long)ksu_rc_len + (long long)module_rc_len;
+
+	pr_info("%s: adding ksu_rc_len: %lld -> %lld (ksu_rc_len: %zu, module_rc_len: %zu) \n", syscall_name, stat64_old_size, stat64_new_size, ksu_rc_len, module_rc_len);
+
+	k_stat64.st_size = stat64_new_size;
+
+	if (copy_to_user(statbuf, &k_stat64, sizeof(struct stat64)))
+		pr_info("%s: copy_to_user stat64 failed\n", syscall_name);
+
+	goto out;
+
+stat_native:;
+#endif
+	struct stat k_stat;
+	if (copy_from_user_retry(&k_stat, statbuf, sizeof(struct stat))) {
+		pr_info("%s: read statbuf 0x%lx failed \n", syscall_name, (uintptr_t)statbuf);
+		goto out;
+	}
+
+	// take note of signed + unsigned math here (ksu_rc_len, module_rc_len are size_t)
+	long stat_old_size = (long)k_stat.st_size;
+	long stat_new_size = stat_old_size + (long)ksu_rc_len + (long)module_rc_len;
+
+	pr_info("%s: adding ksu_rc_len: %ld -> %ld (ksu_rc_len: %zu, module_rc_len: %zu) \n", syscall_name, stat_old_size, stat_new_size, ksu_rc_len, module_rc_len);
+
+	k_stat.st_size = stat_new_size;
+
+	if (copy_to_user(statbuf, &k_stat, sizeof(struct stat)))
+		pr_info("%s: copy_to_user stat failed\n", syscall_name);
+
+out:
+	if (got_flipped)
+		preempt_disable();
+
+	return;
 }
 
-int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value)
+void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr)
 {
-    if (*type == EV_KEY && *code == KEY_VOLUMEDOWN) {
-        int val = *value;
-        pr_info("KEY_VOLUMEDOWN val: %d\n", val);
-        if (val) {
-            // key pressed, count it
-            volumedown_pressed_count += 1;
-            if (is_volumedown_enough(volumedown_pressed_count)) {
-                ksu_stop_input_hook_runtime();
-            }
-        }
-    }
-
-    return 0;
+#ifdef KSU_CAN_USE_JUMP_LABEL
+	if (static_branch_likely(&ksud_vfs_read_key))
+		ksu_common_newfstat_ret(*fd, (void **)statbuf_ptr, STAT_NATIVE, "sys_newfstat");
+#else
+	if (unlikely(ksu_vfs_read_hook))
+		ksu_common_newfstat_ret(*fd, (void **)statbuf_ptr, STAT_NATIVE, "sys_newfstat");
+#endif
 }
 
+#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr)
+{
+#ifdef KSU_CAN_USE_JUMP_LABEL
+	if (static_branch_likely(&ksud_vfs_read_key))
+		ksu_common_newfstat_ret(*(unsigned int *)fd, (void **)statbuf_ptr, STAT_STAT64, "sys_fstat64"); // WARNING: LE-only!!!
+#else
+	if (unlikely(ksu_vfs_read_hook))
+		ksu_common_newfstat_ret(*(unsigned int *)fd, (void **)statbuf_ptr, STAT_STAT64, "sys_fstat64"); // WARNING: LE-only!!!
+#endif
+}
+#endif
+
+static bool safe_mode_flag = false;
+#define VOLUME_PRESS_THRESHOLD_COUNT 3
 bool ksu_is_safe_mode()
 {
-    static bool safe_mode = false;
-    if (safe_mode) {
-        // don't need to check again, userspace may call multiple times
-        return true;
-    }
+	// don't need to check again, userspace may call multiple times
+	static bool already_checked = false;
+	if (already_checked)
+		return true;
 
-    if (ksu_late_loaded) {
-        return false;
-    }
+	// stop hook first!
+	ksu_stop_input_hook_runtime();
 
-    // stop hook first!
-    ksu_stop_input_hook_runtime();
-
-    pr_info("volumedown_pressed_count: %d\n", volumedown_pressed_count);
-    if (is_volumedown_enough(volumedown_pressed_count)) {
-        // pressed over 3 times
-        pr_info("KEY_VOLUMEDOWN pressed max times, safe mode detected!\n");
-        safe_mode = true;
-        return true;
-    }
-
-    return false;
+	if (!safe_mode_flag)
+		return false;
+		
+	pr_info("volume keys pressed max times, safe mode detected!\n");
+	already_checked = true;
+	return true;
 }
 
-static void ksu_execve_hook_ksud_common(const char __user *filename_user, const char __user *const __user *argv_user)
+static void vol_detector_event(struct input_handle *handle, unsigned int type, unsigned int code, int value)
 {
-    struct user_arg_ptr argv = { .ptr.native = argv_user };
-    char path[32];
-    long ret;
-    unsigned long addr;
-    const char __user *fn;
+	static int vol_up_cnt = 0;
+	static int vol_down_cnt = 0;
 
-    if (!filename_user)
-        return;
+	if (!value)
+		return;
+	
+	if (type != EV_KEY)
+		return;
+	
+	if (code == KEY_VOLUMEDOWN) {
+		vol_down_cnt++;
+		pr_info("KEY_VOLUMEDOWN press detected!\n");
+	}
 
-    addr = untagged_addr((unsigned long)filename_user);
-    fn = (const char __user *)addr;
+	if (code == KEY_VOLUMEUP) {
+		vol_up_cnt++;
+		pr_info("KEY_VOLUMEUP press detected!\n");
+	}
 
-    memset(path, 0, sizeof(path));
-    ret = strncpy_from_user(path, fn, 32);
-    if (ret < 0) {
-        pr_err("Access filename failed for execve_handler_pre\n");
-        return;
-    }
+	pr_info("volume_pressed_count: vol_up: %d vol_down: %d\n", vol_up_cnt, vol_down_cnt);
 
-    ksu_handle_execveat_ksud(path, &argv);
+	/*
+	 * on upstream we call stop_input_hook() here but this is causing issues
+	 * #1. unregistering an input handler inside the input handler is a bad meme
+	 * #2. when I tried to defer unreg to a kthread, it also causes issues on some users? nfi.
+	 * since unregging is done anyway on ksu_is_safe_mode() or on_post_fs_data() we just dont bother.
+	 *
+	 */
+	if (vol_up_cnt >= VOLUME_PRESS_THRESHOLD_COUNT || vol_down_cnt >= VOLUME_PRESS_THRESHOLD_COUNT) {
+		pr_info("volume keys pressed max times, safe mode detected!\n");
+		safe_mode_flag = true;
+	}
 }
 
-void ksu_execve_hook_ksud(const struct pt_regs *regs)
+static int vol_detector_connect(struct input_handler *handler, struct input_dev *dev,
+					  const struct input_device_id *id)
 {
-    const char __user *filename_user = (const char __user *)PT_REGS_SYSCALL_PARM1(regs);
-    const char __user *const __user *argv_user = (const char __user *const __user *)PT_REGS_PARM2(regs);
+	struct input_handle *handle;
+	int error;
 
-    ksu_execve_hook_ksud_common(filename_user, argv_user);
+	handle = kzalloc(sizeof(struct input_handle), GFP_KERNEL);
+	if (!handle)
+		return -ENOMEM;
+
+	handle->dev = dev;
+	handle->handler = handler;
+	handle->name = "ksu_handle_input";
+
+	error = input_register_handle(handle);
+	if (error)
+		goto err_free_handle;
+
+	error = input_open_device(handle);
+	if (error)
+		goto err_unregister_handle;
+
+	return 0;
+
+err_unregister_handle:
+	input_unregister_handle(handle);
+err_free_handle:
+	kfree(handle);
+	return error;
 }
 
-void ksu_execveat_hook_ksud(const struct pt_regs *regs)
-{
-    const char __user *filename_user = (const char __user *)PT_REGS_PARM2(regs);
-    const char __user *const __user *argv_user = (const char __user *const __user *)PT_REGS_PARM3(regs);
-
-    ksu_execve_hook_ksud_common(filename_user, argv_user);
-}
-
-static long (*orig_sys_read)(const struct pt_regs *regs);
-static long ksu_sys_read(const struct pt_regs *regs)
-{
-    unsigned int fd = PT_REGS_SYSCALL_PARM1(regs);
-    char __user **buf_ptr = (char __user **)&PT_REGS_PARM2(regs);
-    size_t *count_ptr = (size_t *)&PT_REGS_PARM3(regs);
-
-    ksu_handle_sys_read(fd, buf_ptr, count_ptr);
-    return orig_sys_read(regs);
-}
-
-static long (*orig_sys_fstat)(const struct pt_regs *regs);
-static long ksu_sys_fstat(const struct pt_regs *regs)
-{
-    unsigned int fd = PT_REGS_SYSCALL_PARM1(regs);
-    void __user *statbuf = (void __user *)PT_REGS_PARM2(regs);
-    bool is_rc = false;
-    long ret;
-
-    struct file *file = fget(fd);
-    if (file) {
-        if (is_init_rc(file)) {
-            pr_info("stat init.rc");
-            is_rc = true;
-            load_module_rc_once();
-        }
-        fput(file);
-    }
-
-    ret = orig_sys_fstat(regs);
-
-    if (is_rc) {
-        void __user *st_size_ptr = statbuf + offsetof(struct stat, st_size);
-        long size, new_size;
-        size_t extra = ksu_rc_len + module_rc_len;
-        if (!copy_from_user_nofault(&size, st_size_ptr, sizeof(long))) {
-            new_size = size + extra;
-            pr_info("adding rc len: %ld -> %ld (static=%zu module=%zu)", size, new_size, ksu_rc_len, module_rc_len);
-            if (!copy_to_user_nofault(st_size_ptr, &new_size, sizeof(long))) {
-                pr_info("added rc len");
-            } else {
-                pr_err("add rc len failed: statbuf 0x%lx", (unsigned long)st_size_ptr);
-            }
-        } else {
-            pr_err("read statbuf 0x%lx failed", (unsigned long)st_size_ptr);
-        }
-    }
-
-    return ret;
-}
-
-static int input_handle_event_handler_pre(struct kprobe *p, struct pt_regs *regs)
-{
-    unsigned int *type = (unsigned int *)&PT_REGS_PARM2(regs);
-    unsigned int *code = (unsigned int *)&PT_REGS_PARM3(regs);
-    int *value = (int *)&PT_REGS_CCALL_PARM4(regs);
-    return ksu_handle_input_handle_event(type, code, value);
-}
-
-static struct kprobe input_event_kp = {
-    .symbol_name = "input_event",
-    .pre_handler = input_handle_event_handler_pre,
+static const struct input_device_id vol_detector_ids[] = { 
+	// we add key volume up so that
+	// 1. if you have broken volume down you get shit
+	// 2. we can make sure to trigger only ksu safemode, not android's safemode.
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_KEYBIT,
+		.evbit = { BIT_MASK(EV_KEY) },
+		.keybit = { [BIT_WORD(KEY_VOLUMEUP)] = BIT_MASK(KEY_VOLUMEUP) },
+	},
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_KEYBIT,
+		.evbit = { BIT_MASK(EV_KEY) },
+		.keybit = { [BIT_WORD(KEY_VOLUMEDOWN)] = BIT_MASK(KEY_VOLUMEDOWN) },
+	},
+	{ }
 };
 
-static void do_stop_input_hook(struct work_struct *work)
+static void vol_detector_disconnect(struct input_handle *handle)
 {
-    unregister_kprobe(&input_event_kp);
+	input_close_device(handle);
+	input_unregister_handle(handle);
+	kfree(handle);
+}
+
+MODULE_DEVICE_TABLE(input, vol_detector_ids);
+
+static struct input_handler vol_detector_handler = {
+        .event =	vol_detector_event,
+        .connect =	vol_detector_connect,
+        .disconnect =	vol_detector_disconnect,
+        .name =		"ksu",
+        .id_table =	vol_detector_ids,
+};
+
+static int vol_detector_init()
+{
+	pr_info("vol_detector: init\n");
+	return input_register_handler(&vol_detector_handler);
+}
+
+static int vol_detector_exit()
+{
+	pr_info("vol_detector: exit\n");
+	input_unregister_handler(&vol_detector_handler);
+	return 0;
+}
+
+/**
+ * we do this so that if theres no ksud to call on_post_fs_data/ksu_is_safe_mode/on_boot_completed
+ * there will be no input handler / extra execve branch that stays around
+ * 60s is more than enough time from second_stage to decrypt/post_fs_data
+ * if theres no ksud that does that, we trigger the closing of hooks ourselves
+ */
+static int ksu_hook_watchdog(void *data)
+{
+	unsigned int i = 0;
+
+	set_user_nice(current, 19); // low prio
+	pr_info("%s: kthread init!\n", __func__);
+
+start:
+	if (!*(volatile bool *)&ksu_input_hook)
+		goto bail;
+
+	msleep(5000);
+
+	i++;
+
+	if (i < 12)
+		goto start;
+
+	// if this path gets triggerred, it means theres no ksud
+	pr_info("%s: ksud probably absent, closing hooks!\n", __func__);
+
+	// close down input hook
+	ksu_stop_input_hook_runtime();
+
+	ksu_boot_completed = true;
+
+bail:
+	pr_info("%s: kthread exit!\n", __func__);
+	return 0;
 }
 
 static void stop_init_rc_hook()
 {
-    ksu_syscall_table_unhook(__NR_read);
-    ksu_syscall_table_unhook(__NR_fstat);
-    pr_info("unregister init_rc syscall hook\n");
+	ksu_vfs_read_hook = false;
+	pr_info("stop vfs_read_hook\n");
+	ksu_disable_vfs_read_branch();
+	ksu_disable_preinit_branch(nullptr);
+
+	kthread_run(ksu_hook_watchdog, NULL, "watchdog");
 }
 
-void ksu_stop_input_hook_runtime(void)
+static void ksu_stop_input_hook_runtime()
 {
-    static bool input_hook_stopped = false;
-    if (input_hook_stopped) {
-        return;
-    }
-    input_hook_stopped = true;
-    bool ret = schedule_work(&stop_input_hook_work);
-    pr_info("unregister input kprobe: %d!\n", ret);
+	if (!ksu_input_hook) { return; }
+	ksu_input_hook = false;
+	pr_info("stop input_hook\n");
+	
+	vol_detector_exit();
 }
 
-// ksud: module support
 void __init ksu_ksud_init()
 {
-    int ret;
-
-    ksu_syscall_table_hook(__NR_read, ksu_sys_read, &orig_sys_read);
-    ksu_syscall_table_hook(__NR_fstat, ksu_sys_fstat, &orig_sys_fstat);
-
-    ret = register_kprobe(&input_event_kp);
-    pr_info("ksud: input_event_kp: %d\n", ret);
-
-    INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
+	vol_detector_init();
 }
 
-void __exit ksu_ksud_exit()
-{
-    // TODO:
-    // this should be done before unregister vfs_read_kp
-    // stop_init_rc_hook();
-    unregister_kprobe(&input_event_kp);
-
-    if (module_rc_buf) {
-        free_module_rc();
-    }
-}

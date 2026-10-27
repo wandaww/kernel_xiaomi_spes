@@ -1,9 +1,7 @@
 #ifndef __KSU_H_ALLOWLIST
 #define __KSU_H_ALLOWLIST
 
-#include <linux/types.h>
-#include <linux/uidgid.h>
-#include "uapi/app_profile.h"
+#include "app_profile.h"
 
 #define PER_USER_RANGE 100000
 #define WEBVIEW_ZYGOTE_UID 1053
@@ -24,10 +22,13 @@ void ksu_show_allow_list(void);
 bool __ksu_is_allow_uid(uid_t uid);
 #define ksu_is_allow_uid(uid) unlikely(__ksu_is_allow_uid(uid))
 
-// Grant-state query only; authorize current with ksu_is_allow_uid_for_current().
+// Check if the uid is in allow list, or current is ksu domain root.
+// Only reflects the grant state, use ksu_is_allow_uid_for_current() to
+// authorize current.
 bool ksu_is_uid_granted_root(uid_t uid);
 
-// Grant state plus current-task restrictions, including trusted shell ancestry.
+// ksu_is_uid_granted_root() plus extra restrictions on current, e.g. shell
+// may have to descend from adbd or a ksu domain process
 bool __ksu_is_allow_uid_for_current(uid_t uid);
 #define ksu_is_allow_uid_for_current(uid) unlikely(__ksu_is_allow_uid_for_current(uid))
 
@@ -49,13 +50,13 @@ void ksu_put_root_profile(struct root_profile *);
 
 static inline bool is_appuid(uid_t uid)
 {
-    uid_t appid = uid % PER_USER_RANGE;
-    return appid >= FIRST_APPLICATION_UID && appid <= LAST_APPLICATION_UID;
+	uid_t appid = uid % PER_USER_RANGE;
+	return appid >= FIRST_APPLICATION_UID && appid <= LAST_APPLICATION_UID;
 }
 
 static inline bool is_isolated_process(uid_t uid)
 {
-    uid_t appid = uid % PER_USER_RANGE;
-    return appid >= FIRST_ISOLATED_UID && appid <= LAST_ISOLATED_UID;
+	uid_t appid = uid % PER_USER_RANGE;
+	return appid >= FIRST_ISOLATED_UID && appid <= LAST_ISOLATED_UID;
 }
 #endif
