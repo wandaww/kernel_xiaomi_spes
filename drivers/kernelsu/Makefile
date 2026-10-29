@@ -1,6 +1,7 @@
 # NOTE: unity build. single unit.
 
-obj-$(CONFIG_KSU) := ksu.o
+obj-$(CONFIG_KSU) := kernelsu.o
+kernelsu-y := ksu.o
 
 CFLAGS_ksu.o += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
 CFLAGS_ksu.o += -I$(objtree)/security/selinux
@@ -11,8 +12,8 @@ MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 $(info -- KDIR: $(KDIR))
 $(info -- MDIR: $(MDIR))
 
-# compliant to last upstream kernel change as of 469c428
-KSU_VERSION := 32700
+# compliant to last upstream kernel change as of 528bafc
+KSU_VERSION := 32704
 KSU_VERSION_TAG := v3.3.1
 KSU_KSUN_TAG := v3.4.2
 KSU_BKSU_TAG := v4.2.0
@@ -54,11 +55,6 @@ CFLAGS_ksu.o += -DKSU_PACKAGE_NAME=\"$(KSU_PACKAGE_NAME)\"
 CFLAGS_ksu.o += -DEXPECTED_SIZE=$(KSU_EXPECTED_SIZE)
 CFLAGS_ksu.o += -DEXPECTED_HASH=\"$(KSU_EXPECTED_HASH)\"
 
-ifeq ($(shell grep -q "^struct security_operations selinux_ops" $(srctree)/security/selinux/hooks.c; echo $$?),0)
-$(info -- KernelSU/compat: exported selinux_ops found!)
-CFLAGS_ksu.o += -DKSU_HAS_EXPORTED_SELINUX_OPS
-endif
-
 ifeq ($(shell grep -q " current_sid(void)" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
 CFLAGS_ksu.o += -DKSU_COMPAT_HAS_CURRENT_SID
 endif
@@ -80,11 +76,6 @@ endif
 # half-assed-backport from 5.1
 ifeq ($(shell grep -q "struct type_datum \*\*type_val_to_struct_array;" $(srctree)/security/selinux/ss/policydb.h; echo $$?),0)
 CFLAGS_ksu.o += -DKSU_TYPE_VAL_TO_STRUCT_ARRAY
-endif
-
-ifeq ($(shell grep -q "^DEFINE_RWLOCK(policy_rwlock);" $(srctree)/security/selinux/ss/services.c; echo $$?),0)
-$(info -- KernelSU/compat: exported policy_rwlock found!)
-CFLAGS_ksu.o += -DKSU_COMPAT_HAS_EXPORTED_POLICY_RWLOCK
 endif
 
 # branch link hook vfs_statx, this newer version uses struct filename

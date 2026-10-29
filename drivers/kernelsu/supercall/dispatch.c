@@ -1,8 +1,4 @@
 #include "../manager/apk_sign.h"
-#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
-#include "../feature/kernel_umount.h"
-#include <linux/mount.h>
-#endif
 #ifdef CONFIG_KSU_SUSFS
 #include <linux/namei.h>
 #include <linux/susfs.h>
@@ -584,90 +580,6 @@ static int do_nuke_ext4_sysfs(void __user *arg)
 
 struct list_head mount_list = LIST_HEAD_INIT(mount_list);
 DECLARE_RWSEM(mount_list_lock);
-
-#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
-void susfs_add_try_umount(void __user **user_info)
-{
-    struct st_susfs_try_umount info = {0};
-    struct mount_entry *entry, *new_entry;
-    size_t path_len;
-    unsigned int flags;
-    int err = 0;
-
-    if (!user_info || !*user_info) {
-        return;
-    }
-
-    if (copy_from_user(&info, (void __user *)*user_info, sizeof(info))) {
-        err = -EFAULT;
-        goto out;
-    }
-
-    path_len = strnlen(info.target_pathname,
-                       sizeof(info.target_pathname));
-    if (path_len == 0) {
-        err = -EINVAL;
-        goto out;
-    }
-    if (path_len >= sizeof(info.target_pathname)) {
-        err = -ENAMETOOLONG;
-        goto out;
-    }
-    if (info.target_pathname[0] != '/') {
-        err = -EINVAL;
-        goto out;
-    }
-
-    if (info.mnt_mode == TRY_UMOUNT_DEFAULT) {
-        flags = 0;
-    } else if (info.mnt_mode == TRY_UMOUNT_DETACH) {
-        flags = MNT_DETACH;
-    } else {
-        err = -EINVAL;
-        goto out;
-    }
-
-    new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-    if (!new_entry) {
-        err = -ENOMEM;
-        goto out;
-    }
-
-    new_entry->umountable = kstrdup(info.target_pathname, GFP_KERNEL);
-    if (!new_entry->umountable) {
-        kfree(new_entry);
-        err = -ENOMEM;
-        goto out;
-    }
-    new_entry->flags = flags;
-
-    down_write(&mount_list_lock);
-    list_for_each_entry(entry, &mount_list, list) {
-        if (!strcmp(entry->umountable, info.target_pathname)) {
-            err = -EEXIST;
-            break;
-        }
-    }
-
-    if (!err) {
-        list_add(&new_entry->list, &mount_list);
-    }
-    up_write(&mount_list_lock);
-
-    if (err) {
-        kfree(new_entry->umountable);
-        kfree(new_entry);
-    } else {
-        pr_info("susfs: TRY_UMOUNT added: %s mode=%d\n",
-                info.target_pathname, info.mnt_mode);
-    }
-
-out:
-	if (err)
-		pr_err("susfs: TRY_UMOUNT failed: path=%s err=%d\n",
-		       info.target_pathname, err);
-}
-#endif
 
 static int add_try_umount(void __user *arg)
 {

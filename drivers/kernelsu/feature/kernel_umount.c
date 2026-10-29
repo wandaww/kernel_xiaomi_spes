@@ -84,6 +84,7 @@ void try_umount(const char *mnt, int flags)
 	ksu_umount_mnt(&path, flags);
 #endif
 }
+#if !defined(CONFIG_KSU_SUSFS) || !defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)
 static inline int ksu_handle_umount(struct cred *new, const struct cred *old)
 {
 	uid_t new_uid = ksu_get_uid_t(new->uid);
@@ -120,12 +121,11 @@ static inline int ksu_handle_umount(struct cred *new, const struct cred *old)
 		return 0;
 	}
 #endif // #if defined(CONFIG_KSU_SUSFS) || !defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)
-
-#ifdef CONFIG_KSU_HOSTSREDIRECT
-	set_thread_flag(TIF_KSU_UNMOUNTABLE);
-#endif
 	// umount the target mnt
 	pr_info("handle umount for uid: %d, pid: %d\n", new_uid, current->pid);
+
+	// hostsredirect and getpriority filter tracks this flag
+	set_thread_flag(TIF_KSU_UNMOUNTABLE);
 
 	const struct cred *saved = override_creds(ksu_cred);
 
@@ -141,6 +141,7 @@ static inline int ksu_handle_umount(struct cred *new, const struct cred *old)
 
 	return 0;
 }
+#endif // #if defined(CONFIG_KSU_SUSFS) || !defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)
 
 void __init ksu_kernel_umount_init(void)
 {
