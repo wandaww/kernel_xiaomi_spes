@@ -1,0 +1,173 @@
+use anyhow::{Context, Result};
+use log::{info, warn};
+use std::{ffi::CString, process::Command, time::Instant};
+
+use crate::module::{ScriptWait, handle_updated_modules, prune_modules};
+use crate::{assets, defs, init_event, magic_mount, mount_guard, restorecon, utils};
+
+fn dump_process_info(label: &str) {
+    use rustix::process::{getgid, getgroups, getpid, getuid};
+
+    let pid = getpid().as_raw_nonzero();
+    let uid = getuid().as_raw();
+    let gid = getgid().as_raw();
+    let groups: Vec<String> = getgroups()
+        .unwrap_or_default()
+        .iter()
+        .map(|g| g.as_raw().to_string())
+        .collect();
+    let selinux = std::fs::read_to_string("/proc/self/attr/current")
+        .unwrap_or_else(|_| "unknown".to_string());
+    let seccomp = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Seccomp:"))
+                .map(|l| l.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    info!(
+        "[{label}] pid={pid}, uid={uid}, gid={gid}, groups=[{}], selinux={}, {seccomp}",
+        groups.join(","),
+        selinux.trim(),
+    );
+}
+
+pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
+    utils::daemonize(false)?;
+    info!("late-load command triggered!");
+    dump_process_info("late-load start");
+
+    // 1. Check if KernelSU is already loaded
+    if ksuinit::has_kernelsu() {
+        info!("KernelSU already loaded, skip loading ko");
+    } else {
+        // 2. Detect current KMI version
+        let kmi = kmi.map_or_else(
+            || crate::boot_patch::get_current_kmi().context("Failed to detect current KMI version"),
+            Ok,
+        )?;
+        info!("Detected KMI: {kmi}");
+
+        // 3. Get kernelsu.ko from embedded assets
+        let ko_name = format!("{kmi}_kernelsu.ko");
+        let ko_data = assets::get_asset_data(&ko_name)
+            .with_context(|| format!("Failed to get {ko_name} from assets"))?;
+
+        // 4. Load kernelsu.ko from memory with manual relocation
+        info!("Loading kernelsu.ko for KMI {kmi}...");
+        // bundled flag is meaningless in jailbreak mode since we can't flash boot to update it.
+        let vivo_family = crate::boot_patch::detected_vivo_family();
+        let params = crate::boot_patch::late_load_module_params(allow_shell, vivo_family);
+        if vivo_family == Some(true)
+            && std::fs::read_to_string("/proc/modules").is_ok_and(|modules| {
+                modules
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some("vr"))
+            })
+        {
+            warn!(
+                "vr module is already loaded; vivo_module_filter only blocks future loads and cannot remove it"
+            );
+        }
+        let params = CString::new(params).context("Invalid kernelsu module parameters")?;
+        ksuinit::load_module(&ko_data, &params).context("Failed to load kernelsu.ko")?;
+        info!("kernelsu.ko loaded successfully!");
+        dump_process_info("after load_module");
+    }
+
+    // We need to reset stdin/stdout/stderr; otherwise, sending file descriptors via cmd transactions
+    // will be blocked by SELinux because its fsec->sid is still u:r:su:s0 instead of u:r:ksu:s0.
+    utils::reset_std()?;
+
+    utils::umask(0);
+
+    if let Err(e) = crate::module_config::clear_all_temp_configs() {
+        warn!("clear temp configs failed: {e}");
+    }
+
+    utils::install(None, None).context("Failed to install ksud")?;
+
+    crate::hot_install::clean_trash();
+
+    // 5. Handle module updates
+    if let Err(e) = handle_updated_modules() {
+        warn!("handle updated modules failed: {e}");
+    }
+
+    if let Err(e) = prune_modules() {
+        warn!("prune modules failed: {e}");
+    }
+
+    if let Err(e) = restorecon::restorecon() {
+        warn!("restorecon failed: {e}");
+    }
+
+    // 6. Load SELinux rules
+    if crate::module::load_sepolicy_rule().is_err() {
+        warn!("load sepolicy.rule failed");
+    }
+
+    if let Err(e) = crate::profile::apply_sepolies() {
+        warn!("apply root profile sepolicy failed: {e}");
+    }
+
+    // 7. Initialize features
+    crate::feature::init_forced_features();
+    if let Err(e) = crate::feature::init_features() {
+        warn!("init features failed: {e}");
+    }
+
+    // 8. Execute late-load stage scripts with a shared boot deadline
+    let wait = ScriptWait::Until(Instant::now() + defs::BOOT_STAGE_TIMEOUT);
+    init_event::run_stage("late-load", wait);
+
+    // 9. Load system.prop
+    if let Err(e) = crate::module::load_system_prop() {
+        warn!("load system.prop failed: {e}");
+    }
+
+    // 10. Run the selected provider (metamodule script or built-in executor).
+    if let Err(e) = magic_mount::mount_selected_provider() {
+        warn!("module mount failed: {e:#}");
+    }
+
+    match crate::umount_config::apply() {
+        Ok(report) if report.failed > 0 => warn!(
+            "umount config: {} applied, {} present, {} failed",
+            report.applied, report.existing, report.failed
+        ),
+        Ok(_) => {}
+        Err(e) => warn!("umount config could not be read or applied: {e:#}"),
+    }
+
+    // 11. Execute post-mount stage scripts using the same deadline
+    init_event::run_stage("post-mount", wait);
+
+    // 12. Execute service stage scripts (non-blocking)
+    init_event::run_stage("service", ScriptWait::NoWait);
+
+    // 13. Execute boot-completed stage scripts (non-blocking)
+    init_event::run_stage("boot-completed", ScriptWait::NoWait);
+
+    // The jailbreak path reaches the end of its own boot sequence here, so the
+    // step recorded for it is done: a record that survives has to mean the
+    // injection stopped this device instead.
+    mount_guard::clear_if_ours(std::path::Path::new(defs::MOUNT_INFLIGHT))?;
+
+    // 14. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module
+    info!("Restarting KernelSU Manager {package_name}...");
+    let _ = Command::new("am")
+        .args(["force-stop", package_name])
+        .status();
+    let _ = Command::new("am")
+        .args([
+            "start",
+            "-n",
+            &format!("{package_name}/me.weishu.kernelsu.ui.MainActivity"),
+        ])
+        .status();
+
+    Ok(())
+}

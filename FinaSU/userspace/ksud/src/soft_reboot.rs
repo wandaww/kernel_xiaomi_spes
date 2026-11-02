@@ -1,0 +1,299 @@
+use std::{
+    fs::File,
+    io::Write,
+    os::fd::{AsRawFd, OwnedFd},
+    path::Path,
+    process::{Child, Command},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use libc::_exit;
+use log::{error, info, warn};
+use prop_rs_android::{resetprop::ResetProp, sys_prop};
+use rustix::{
+    event::{PollFd, PollFlags, poll},
+    fs::{MemfdFlags, Timespec, memfd_create},
+    io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd, read},
+    pipe::{PipeFlags, pipe_with},
+    process::chdir,
+};
+
+use crate::{
+    assets, defs,
+    init_event::{on_boot_completed, on_post_fs_data, on_services, run_stage},
+    ksucalls,
+    module::ScriptWait,
+    utils::{self, switch_mnt_ns},
+};
+
+const WAITSYS_FD_ENV: &str = "KSU_WAITSYS_FD";
+
+struct Waitsys {
+    child: Child,
+    read_fd: OwnedFd,
+}
+
+impl Waitsys {
+    fn spawn() -> Result<Self> {
+        let waitsys = assets::get_asset_data("waitsys").context("waitsys is not embedded")?;
+        let executable_fd = memfd_create("waitsys", MemfdFlags::CLOEXEC)
+            .context("failed to create waitsys memfd")?;
+        let mut executable = File::from(executable_fd);
+        executable
+            .write_all(&waitsys)
+            .context("failed to write waitsys to memfd")?;
+
+        let (read_fd, write_fd) =
+            pipe_with(PipeFlags::CLOEXEC).context("failed to create waitsys pipe")?;
+        fcntl_setfd(
+            &write_fd,
+            fcntl_getfd(&write_fd).context("get write_fd flags")? & !FdFlags::CLOEXEC,
+        )
+        .context("set write_fd flags")?;
+
+        let mut cmd = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+        cmd.env(WAITSYS_FD_ENV, format!("{}", write_fd.as_raw_fd()));
+        let child = cmd.spawn()?;
+
+        drop(write_fd);
+        drop(executable);
+        Ok(Self { child, read_fd })
+    }
+
+    fn wait_for_signal(&self, expected: u8, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timed out waiting for signal {expected}");
+            }
+            let remaining = Timespec::try_from(remaining)?;
+            let mut poll_fd = [PollFd::new(&self.read_fd, PollFlags::IN)];
+            let ready = match poll(&mut poll_fd, Some(&remaining)) {
+                Err(Errno::INTR) => continue,
+                result => result,
+            }?;
+            if ready == 0 {
+                bail!("timed out waiting for signal {expected}");
+            }
+
+            let mut signal = [0_u8; 1];
+            let bytes_read = match read(&self.read_fd, &mut signal) {
+                Err(Errno::INTR) => continue,
+                result => result,
+            }?;
+            ensure!(
+                bytes_read == 1,
+                "waitsys pipe closed before signal {expected}"
+            );
+            let signal = signal[0];
+            ensure!(
+                signal == expected,
+                "unexpected waitsys signal {signal}, expected {expected}"
+            );
+            return Ok(());
+        }
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        self.child.kill().ok();
+        self.child.wait().context("wait for waitsys")?;
+        Ok(())
+    }
+}
+
+impl Drop for Waitsys {
+    fn drop(&mut self) {
+        if let Err(error) = self.terminate() {
+            warn!("failed to clean up waitsys: {error:#}");
+        }
+    }
+}
+
+fn terminate_waitsys(waitsys: &mut Option<Waitsys>) {
+    if let Some(mut waitsys) = waitsys.take()
+        && let Err(error) = waitsys.terminate()
+    {
+        warn!("failed to clean up waitsys: {error:#}");
+    }
+}
+
+const fn resetprop() -> ResetProp {
+    ResetProp {
+        skip_svc: true,
+        persistent: false,
+        persist_only: false,
+        verbose: false,
+        show_context: false,
+        rebuild: false,
+    }
+}
+
+fn reset_boot_completed() -> Result<()> {
+    sys_prop::init().context("Failed to initialize system property API")?;
+    let rp = resetprop();
+    // Set prop value to 0 in advance to ensure resetprop -w works
+    info!("reset boot complete prop to 0");
+    rp.set("sys.boot_completed", "0")
+        .context("Failed to set sys.boot_completed to 0")?;
+    Ok(())
+}
+
+fn wait_for_boot_completed() -> Result<()> {
+    sys_prop::init().context("Failed to initialize system property API")?;
+    let rp = resetprop();
+    info!("waiting for boot complete");
+    rp.wait("sys.boot_completed", Some("0"), None)
+        .context("wait for sys.boot_completed failed")?;
+    Ok(())
+}
+
+fn restore_boot_completed() -> Result<()> {
+    sys_prop::init().context("Failed to initialize system property API")?;
+    resetprop()
+        .set("sys.boot_completed", "1")
+        .map(|_| ())
+        .context("Failed to restore sys.boot_completed")
+}
+
+fn start_android() -> Result<()> {
+    info!("start");
+    let status = Command::new("start").status().context("start failed")?;
+    ensure!(status.success(), "start exited with status: {status}");
+    Ok(())
+}
+
+fn restart_after_failed_soft_reboot(reason: &str) -> anyhow::Error {
+    warn!("soft reboot aborted: {reason}");
+    if let Err(error) = restore_boot_completed() {
+        warn!("failed to restore boot completion: {error:#}");
+    }
+    if let Err(error) = start_android() {
+        return anyhow::anyhow!(
+            "Soft reboot aborted: {reason}; Android restart also failed: {error:#}"
+        );
+    }
+    anyhow::anyhow!(
+        "Soft reboot aborted: {reason}; Android userspace was restarted without advancing the startup generation"
+    )
+}
+
+pub fn soft_reboot() -> Result<()> {
+    // check it avoid user click "soft_reboot" in manager when version mismatch
+    if let Err(e) = ksucalls::ensure_uapi_version_matched() {
+        error!("{e:#}, skip soft_reboot");
+        return Ok(());
+    }
+
+    let operation_lock = crate::startup_epoch::try_lock(
+        Path::new(defs::SOFT_REBOOT_LOCK),
+        "Another soft reboot is already in progress",
+    )?;
+
+    utils::daemonize_with(true, || -> Result<()> {
+        switch_mnt_ns(1)?;
+        chdir("/")?;
+        Ok(())
+    })?;
+    crate::startup_epoch::retain_operation_lock(operation_lock)?;
+
+    info!("emulating soft_reboot!");
+    if let Err(e) = reset_boot_completed() {
+        warn!("reset boot completed failed: {e}");
+    }
+    run_stage(
+        "emulated-soft-reboot",
+        ScriptWait::Until(Instant::now() + defs::EMULATED_SOFT_REBOOT_TIMEOUT),
+    );
+
+    let mut waitsys = match Waitsys::spawn() {
+        Ok(waitsys) => Some(waitsys),
+        Err(error) => {
+            warn!("failed to start waitsys: {error:#}");
+            None
+        }
+    };
+    if waitsys.is_none() {
+        return Err(restart_after_failed_soft_reboot(
+            "the service tracker could not start",
+        ));
+    }
+    let services_ready = waitsys.as_ref().is_some_and(|waitsys| {
+        if let Err(error) = waitsys.wait_for_signal(1, defs::WAITSYS_READY_TIMEOUT) {
+            warn!("waitsys failed to collect services: {error:#}");
+            false
+        } else {
+            true
+        }
+    });
+    if !services_ready {
+        terminate_waitsys(&mut waitsys);
+        return Err(restart_after_failed_soft_reboot(
+            "the service tracker did not become ready",
+        ));
+    }
+
+    if let Err(error) = crate::zygisk::prepare_soft_reboot() {
+        return Err(restart_after_failed_soft_reboot(&format!(
+            "FolkZygisk could not prepare for a new userspace cycle: {error:#}"
+        )));
+    }
+
+    info!("stop");
+    let status = match Command::new("stop").status() {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(restart_after_failed_soft_reboot(&format!(
+                "could not execute stop: {error}"
+            )));
+        }
+    };
+    if !status.success() {
+        warn!("stop exited with status: {status}");
+    }
+
+    let waited_for_stop = waitsys.as_ref().map(|waitsys| {
+        if let Err(error) = waitsys.wait_for_signal(2, defs::WAITSYS_STOP_TIMEOUT) {
+            warn!("waitsys failed while waiting for services to stop: {error:#}");
+            false
+        } else {
+            true
+        }
+    });
+    terminate_waitsys(&mut waitsys);
+
+    if !crate::startup_epoch::stop_confirmed(status.success(), waited_for_stop) {
+        return Err(restart_after_failed_soft_reboot(
+            "userspace stop was not confirmed",
+        ));
+    }
+
+    let epoch = match crate::startup_epoch::advance_soft_reboot() {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            return Err(restart_after_failed_soft_reboot(&format!(
+                "could not commit the next userspace generation: {error:#}"
+            )));
+        }
+    };
+    info!(
+        "Android userspace startup generation advanced to {}",
+        epoch.generation
+    );
+    info!("post-fs-data");
+    on_post_fs_data()?;
+    if let Err(error) = start_android() {
+        warn!("{error:#}");
+    }
+    info!("services");
+    on_services();
+    if let Err(e) = wait_for_boot_completed() {
+        warn!("wait for boot completed failed: {e}");
+    }
+    on_boot_completed();
+
+    unsafe {
+        _exit(0);
+    }
+}

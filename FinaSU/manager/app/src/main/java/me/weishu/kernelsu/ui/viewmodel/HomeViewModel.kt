@@ -1,0 +1,321 @@
+package me.weishu.kernelsu.ui.viewmodel
+
+import android.os.Build
+import android.system.Os
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import me.weishu.kernelsu.BuildConfig
+import me.weishu.kernelsu.Natives
+import me.weishu.kernelsu.R
+import me.weishu.kernelsu.data.HomeMetrics
+import me.weishu.kernelsu.data.MetricsHistory
+import me.weishu.kernelsu.data.SystemMetricsCollector
+import me.weishu.kernelsu.data.repository.SettingsRepository
+import me.weishu.kernelsu.data.repository.SettingsRepositoryImpl
+import me.weishu.kernelsu.getKernelVersion
+import me.weishu.kernelsu.ksuApp
+import me.weishu.kernelsu.ui.screen.home.HomeMount
+import me.weishu.kernelsu.ui.screen.home.HomeUiState
+import me.weishu.kernelsu.ui.screen.home.SystemInfo
+import me.weishu.kernelsu.ui.screen.home.getManagerVersion
+import me.weishu.kernelsu.ui.screen.home.resolveHomeMountProvider
+import me.weishu.kernelsu.ui.util.CapabilityRepository
+import me.weishu.kernelsu.ui.util.RootShellStatus
+import me.weishu.kernelsu.ui.util.checkNewVersion
+import me.weishu.kernelsu.ui.util.getModuleDisplayName
+import me.weishu.kernelsu.ui.util.getSELinuxStatusRaw
+import me.weishu.kernelsu.ui.util.module.LatestVersionInfo
+import me.weishu.kernelsu.ui.util.resolveDeviceName
+
+class HomeViewModel(
+    private val settingsRepo: SettingsRepository = SettingsRepositoryImpl()
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(buildState())
+    val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
+
+    /**
+     * The home screen must follow the same capability snapshot as the layout and navigation, so a
+     * root probe that finishes, fails or recovers updates the warnings and counts without a manual
+     * refresh. Identity changes rebuild the whole state (version/UAPI/lkm fields depend on it); a
+     * mere root-state change only patches the root fields, keeping the layout stable.
+     */
+    private var lastIsManager: Boolean? = null
+    private var lastUapiCompatible: Boolean? = null
+
+    /** Monotonic guard so an older refresh cannot overwrite a newer one. */
+    private var refreshToken = 0L
+    private val susfsRepository = me.weishu.kernelsu.data.susfs.SusfsRepository()
+    private var susfsToken = 0L
+    private var zygiskToken = 0L
+    private var mountToken = 0L
+
+    init {
+        viewModelScope.launch {
+            kotlinx.coroutines.flow.combine(
+                me.weishu.kernelsu.ui.util.RootShell.status,
+                me.weishu.kernelsu.ui.util.RootShell.generation,
+            ) { status, generation -> status to generation }.collect { (status, _) ->
+                if (status == RootShellStatus.Ready) {
+                    refreshSusfs()
+                    refreshZygisk()
+                    refreshMount()
+                    // Self-check of the Sui management channel; the settings entry repeats it.
+                    android.util.Log.i("SuiManagement", "self-check starting")
+                    val suiProbe = kotlinx.coroutines.withTimeoutOrNull(3_000) {
+                        settingsRepo.suiProbeManagement()
+                    }
+                    android.util.Log.i(
+                        "SuiManagement",
+                        suiProbe?.getOrElse { "unavailable: ${it.message}" } ?: "timed out",
+                    )
+                    android.util.Log.i(
+                        "SuiManagement",
+                        "launchable apps: ${settingsRepo.suiLaunchableAppCount().getOrNull() ?: -1}",
+                    )
+                    // Verification hook: `settings put global fina_sui_fake_request 1` replays a prompt.
+                    val fake = android.provider.Settings.Global.getInt(
+                        ksuApp.contentResolver,
+                        "fina_sui_fake_request",
+                        0,
+                    ) == 1
+                    if (fake) {
+                        me.weishu.kernelsu.data.sui.SuiPermissionHost.fake("com.example.demo")
+                    }
+                } else {
+                    susfsToken++
+                    zygiskToken++
+                    mountToken++
+                    _uiState.update {
+                        it.copy(
+                            susfs = me.weishu.kernelsu.data.susfs.SusfsStatus(protocol = "root_unavailable"),
+                            zygiskProvider = null,
+                            mount = HomeMount(),
+                        )
+                    }
+                }
+            }
+        }
+        viewModelScope.launch {
+            CapabilityRepository.state.collect { capability ->
+                val identityChanged =
+                    capability.isManager != lastIsManager || capability.uapiCompatible != lastUapiCompatible
+                lastIsManager = capability.isManager
+                lastUapiCompatible = capability.uapiCompatible
+                if (identityChanged) {
+                    refresh()
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isRootAvailable = capability.rootStatus == RootShellStatus.Ready,
+                            rootStatus = capability.rootStatus,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Live device/storage metrics for the home screen. Polled only while a consumer collects the
+     * flow (the focus layout), and stopped a few seconds after it leaves.
+     */
+    val metrics: StateFlow<HomeMetrics> = flow {
+        val cpuTemperature = ArrayDeque<Float>()
+        val memoryUsage = ArrayDeque<Float>()
+        while (true) {
+            val storage = SystemMetricsCollector.collectStorageStatus()
+            val device = SystemMetricsCollector.collectDeviceStatus(ksuApp)
+            device.cpuTemperatureC?.let { cpuTemperature.record(it) }
+            if (storage.ramTotalBytes > 0L) memoryUsage.record(storage.ramUsedFraction * 100f)
+            emit(
+                HomeMetrics(
+                    device = device,
+                    storage = storage,
+                    history = MetricsHistory(
+                        cpuTemperature = cpuTemperature.toList(),
+                        memoryUsage = memoryUsage.toList(),
+                    ),
+                )
+            )
+            delay(METRICS_POLL_INTERVAL_MS)
+        }
+    }.flowOn(Dispatchers.IO)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(METRICS_STOP_TIMEOUT_MS), HomeMetrics())
+
+    fun refresh() {
+        refreshSusfs()
+        refreshZygisk()
+        refreshMount()
+        // Guard against overlapping refreshes: a slower, older build must not overwrite a newer
+        // snapshot (or clobber the capability collector's root update).
+        val token = ++refreshToken
+        viewModelScope.launch {
+            val baseState = withContext(Dispatchers.IO) { buildState() }
+            if (token != refreshToken) return@launch
+            // Re-read the root fields from the latest capability snapshot at commit time, so a
+            // completion of this refresh cannot clobber a root update the collector already applied.
+            val capability = CapabilityRepository.current()
+            _uiState.update {
+                baseState.copy(
+                    susfs = it.susfs,
+                    zygiskProvider = it.zygiskProvider,
+                    mount = it.mount,
+                    isRootAvailable = capability.rootStatus == RootShellStatus.Ready,
+                    rootStatus = capability.rootStatus,
+                )
+            }
+            if (baseState.checkUpdateEnabled) {
+                val latestVersionInfo = withContext(Dispatchers.IO) { checkNewVersion() }
+                if (token != refreshToken) return@launch
+                _uiState.update { it.copy(latestVersionInfo = latestVersionInfo) }
+            }
+        }
+    }
+
+    fun refreshSusfs() {
+        val request = ++susfsToken
+        val generation = me.weishu.kernelsu.ui.util.RootShell.generation.value
+        viewModelScope.launch {
+            val status = try { susfsRepository.status() }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { me.weishu.kernelsu.data.susfs.SusfsStatus(protocol = "root_unavailable", error = e.message) }
+            if (request == susfsToken && generation == me.weishu.kernelsu.ui.util.RootShell.generation.value) {
+                _uiState.update { it.copy(susfs = status) }
+            }
+        }
+    }
+
+    /**
+     * Resolves the active Zygisk implementation for the home card: any active external provider
+     * wins and is named by its module name; otherwise the built-in engine when it is enabled and
+     * installed. Null hides the row.
+     */
+    fun refreshZygisk() {
+        val request = ++zygiskToken
+        viewModelScope.launch {
+            val provider = try {
+                resolveZygiskProvider()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+            if (request == zygiskToken) _uiState.update { it.copy(zygiskProvider = provider) }
+        }
+    }
+
+    /**
+     * Resolves the provider that actually mounted modules this boot. A read failure, or a record
+     * that cannot name one, hides the row rather than guessing.
+     */
+    fun refreshMount() {
+        val request = ++mountToken
+        val generation = me.weishu.kernelsu.ui.util.RootShell.generation.value
+        viewModelScope.launch {
+            val status = settingsRepo.getFolkMountStatus().getOrNull()
+            if (request == mountToken &&
+                generation == me.weishu.kernelsu.ui.util.RootShell.generation.value
+            ) {
+                _uiState.update {
+                    it.copy(
+                        mount = HomeMount(
+                            provider = resolveHomeMountProvider(status),
+                            metamoduleId = status?.metamoduleId,
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun resolveZygiskProvider(): String? {
+        val status = settingsRepo.getFolkZygiskStatus().getOrNull() ?: return null
+        // No provider means the home card has no Zygisk row to name, the same test the settings
+        // group uses to decide whether its switch exists.
+        if (!status.providesImplementation()) return null
+        val injecting = status.injectionState == "injected" ||
+            status.injectionState == "partial" ||
+            status.injectionState == "starting"
+        // The built-in engine only steps aside at boot, so while it is the one injecting it stays
+        // the effective implementation even after an external provider module is installed.
+        if (status.enabled && injecting) return ksuApp.getString(R.string.folkzygisk_builtin_active)
+        status.externalProviders.firstOrNull()?.let { return getModuleDisplayName(it) ?: it }
+        if (status.enabled && status.engineAvailable) return ksuApp.getString(R.string.folkzygisk_builtin_active)
+        return null
+    }
+
+    private fun buildState(): HomeUiState {
+        val kernelVersion = getKernelVersion()
+        val isManager = Natives.isManager
+        val ksuVersion = if (isManager) Natives.version else null
+        val kernelUAPIVersion = if (isManager) Natives.kernelUAPIVersion else null
+        val managerUAPIVersion = Natives.managerUAPIVersion
+        val lkmMode = ksuVersion?.let { if (kernelVersion.isGKI()) Natives.isLkmMode else null }
+        val rootStatus = CapabilityRepository.current().rootStatus
+        val managerVersion = getManagerVersion(ksuApp)
+
+        return HomeUiState(
+            kernelVersion = kernelVersion,
+            ksuVersion = ksuVersion,
+            lkmMode = lkmMode,
+            isLkmBundled = lkmMode == true && Natives.isLkmBundled,
+            isManager = isManager,
+            isManagerPrBuild = BuildConfig.IS_PR_BUILD,
+            isKernelPrBuild = Natives.isPrBuild,
+            requiresNewKernel = isManager && Natives.managerUAPIVersion > Natives.kernelUAPIVersion,
+            requiresNewManager = isManager && Natives.managerUAPIVersion < Natives.kernelUAPIVersion,
+            kernelUAPIVersion = kernelUAPIVersion,
+            kernelHook = if (isManager) runCatching {
+                me.weishu.kernelsu.ui.screen.home.resolveKernelHookState(Natives.getKernelHookFlags())
+            }.getOrDefault(me.weishu.kernelsu.ui.screen.home.KernelHookState()) else
+                me.weishu.kernelsu.ui.screen.home.KernelHookState(),
+            managerUAPIVersion = managerUAPIVersion,
+            isRootAvailable = rootStatus == RootShellStatus.Ready,
+            rootStatus = rootStatus,
+            isSafeMode = Natives.isSafeMode,
+            isLateLoadMode = Natives.isLateLoadMode,
+            checkUpdateEnabled = settingsRepo.checkUpdate,
+            latestVersionInfo = LatestVersionInfo(),
+            currentManagerVersionCode = managerVersion.versionCode,
+            systemInfo = SystemInfo(
+                kernelVersion = Os.uname().release,
+                kernelFullVersion = if (isManager) Natives.getFullVersion() else null,
+                managerVersion = "${managerVersion.versionName} (${managerVersion.versionCode}-${managerUAPIVersion})",
+                deviceModel = resolveDeviceName(),
+                fingerprint = Build.FINGERPRINT,
+                selinuxStatus = getSELinuxStatusRaw(),
+                seccompStatus = runCatching {
+                    Os.prctl(21 /* PR_GET_SECCOMP */, 0, 0, 0, 0)
+                }.getOrDefault(-1),
+            ),
+        )
+    }
+}
+
+/** How often the home screen refreshes its device/storage metrics. */
+private const val METRICS_POLL_INTERVAL_MS = 5_000L
+
+/** How long the metrics keep polling after the last collector goes away. */
+private const val METRICS_STOP_TIMEOUT_MS = 5_000L
+
+/** How many samples the wave charts of the stats board keep, oldest dropped first. */
+private const val METRICS_HISTORY_SIZE = 30
+
+/** Appends a sample, keeping the buffer at its fixed length. */
+private fun ArrayDeque<Float>.record(value: Float) {
+    addLast(value)
+    while (size > METRICS_HISTORY_SIZE) removeFirst()
+}

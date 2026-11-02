@@ -1679,6 +1679,37 @@ static inline bool may_mount(void)
 	return ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN);
 }
 
+int ksu_path_umount(struct path *path, int flags)
+{
+	struct mount *mnt;
+	int ret;
+
+	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE |
+		      UMOUNT_NOFOLLOW))
+		return -EINVAL;
+
+	if (!may_mount())
+		return -EPERM;
+
+	mnt = real_mount(path->mnt);
+
+	if (path->dentry != path->mnt->mnt_root)
+		return -EINVAL;
+
+	if (!check_mnt(mnt))
+		return -EINVAL;
+
+	if (mnt->mnt.mnt_flags & MNT_LOCKED)
+		return -EINVAL;
+
+	if ((flags & MNT_FORCE) && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	ret = do_umount(mnt, flags);
+	return ret;
+}
+
+
 #ifdef	CONFIG_MANDATORY_FILE_LOCKING
 static bool may_mandlock(void)
 {
@@ -2246,6 +2277,13 @@ static int do_change_type(struct path *path, int ms_flags)
 	return err;
 }
 
+int ksu_path_mount(struct path *path, unsigned long flags)
+{
+	if (!may_mount())
+		return -EPERM;
+
+	return do_change_type(path, flags);
+}
 /*
  * do loopback mount.
  */

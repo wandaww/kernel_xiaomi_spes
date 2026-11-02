@@ -1,0 +1,163 @@
+package me.weishu.kernelsu.ui.navigation3
+
+import android.os.SystemClock
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.navigation3.runtime.NavBackStack
+import androidx.navigation3.runtime.NavKey
+import androidx.navigation3.runtime.rememberNavBackStack
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+
+/**
+ * Simple navigation helper that owns a navigation3 back stack.
+ * Supports push/replace/pop/popUntil over the shared [NavBackStack].
+ */
+@Suppress("unused")
+class Navigator(
+    val backStack: NavBackStack<NavKey>,
+) {
+
+    var lastDirection by mutableStateOf(NavDirection.None)
+        private set
+
+    var lastPopAt by mutableStateOf(0L)
+        private set
+
+    fun wasJustPopped(withinMs: Long = 600L): Boolean =
+        lastPopAt > 0L && SystemClock.elapsedRealtime() - lastPopAt < withinMs
+
+    private val resultBus = mutableMapOf<String, MutableSharedFlow<Any>>()
+
+    /**
+     * Push a key onto the back stack, idempotently: a double tap pushing the same route value
+     * twice is a duplicate contentKey (rejected by the runtime), so skip keys already present.
+     * Routes needing multiple live instances carry unique values instead.
+     */
+    fun push(key: NavKey) {
+        if (key !in backStack) {
+            lastDirection = NavDirection.Push
+            backStack.add(key)
+        }
+    }
+
+    /**
+     * Replace the top key, or push if the stack is empty.
+     */
+    fun replace(key: NavKey) {
+        lastDirection = NavDirection.Push
+        if (backStack.isNotEmpty()) {
+            backStack[backStack.lastIndex] = key
+        } else {
+            backStack.add(key)
+        }
+    }
+
+    /**
+     * Replace the backstack with a new list of keys if the stack is not empty.
+     */
+    fun replaceAll(keys: List<NavKey>) {
+        if (keys.isEmpty()) {
+            return
+        }
+        if (backStack.isNotEmpty()) {
+            lastDirection = NavDirection.Push
+            backStack.clear()
+            backStack.addAll(keys)
+        }
+    }
+
+
+    /**
+     * Pop the top key if present.
+     */
+    fun pop() {
+        if (backStack.size > 1) {
+            lastDirection = NavDirection.Pop
+            lastPopAt = SystemClock.elapsedRealtime()
+            backStack.removeLastOrNull()
+        }
+    }
+
+    /**
+     * Pop until predicate matches the top key.
+     */
+    fun popUntil(predicate: (NavKey) -> Boolean) {
+        var changed = false
+        while (backStack.size > 1 && !predicate(backStack.last())) {
+            backStack.removeAt(backStack.lastIndex)
+            changed = true
+        }
+        if (changed) {
+            lastDirection = NavDirection.Pop
+            lastPopAt = SystemClock.elapsedRealtime()
+        }
+    }
+
+    /**
+     * Navigate expecting a result. Caller should subscribe via observeResult(requestKey).
+     */
+    fun navigateForResult(route: Route, requestKey: String) {
+        ensureChannel(requestKey)
+        push(route)
+    }
+
+    /**
+     * Set a result for the given request and then pop.
+     */
+    fun <T : Any> setResult(requestKey: String, value: T) {
+        ensureChannel(requestKey).tryEmit(value)
+        pop()
+    }
+
+    /**
+     * Observe results for a given request key as a SharedFlow.
+     */
+    @Suppress("UNCHECKED_CAST")
+    fun <T : Any> observeResult(requestKey: String): SharedFlow<T> {
+        return ensureChannel(requestKey) as SharedFlow<T>
+    }
+
+    /**
+     * Clear the last emitted result for the request key.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun clearResult(requestKey: String) {
+        ensureChannel(requestKey).resetReplayCache()
+    }
+
+    /**
+     * Get current NavKey on the back stack.
+     */
+    fun current() = backStack.lastOrNull()
+
+    /**
+     * Get current size of back stack.
+     */
+    fun backStackSize() = backStack.size
+
+    private fun ensureChannel(key: String): MutableSharedFlow<Any> {
+        return resultBus.getOrPut(key) { MutableSharedFlow(replay = 1, extraBufferCapacity = 0) }
+    }
+
+}
+
+@Composable
+fun rememberNavigator(startRoute: Route): Navigator {
+    val backStack = rememberNavBackStack(startRoute)
+    return androidx.compose.runtime.remember(backStack) { Navigator(backStack) }
+}
+
+val LocalNavigator = staticCompositionLocalOf<Navigator> {
+    error("LocalNavigator not provided")
+}
+
+enum class NavDirection {
+    None,
+    Push,
+    Pop,
+}

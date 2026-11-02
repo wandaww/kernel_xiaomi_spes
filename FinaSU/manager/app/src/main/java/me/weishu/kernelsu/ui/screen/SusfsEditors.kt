@@ -1,0 +1,552 @@
+package me.weishu.kernelsu.ui.screen
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.AltRoute
+import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
+import androidx.compose.material.icons.rounded.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import me.weishu.kernelsu.R
+import me.weishu.kernelsu.data.boot.KernelFacts
+import me.weishu.kernelsu.data.susfs.SusfsInputs
+import me.weishu.kernelsu.data.susfs.SusfsStatus
+import me.weishu.kernelsu.ui.component.material.*
+import me.weishu.kernelsu.ui.component.kernel.BootSlotSource
+import me.weishu.kernelsu.ui.viewmodel.SusfsViewModel
+import org.json.JSONArray
+import org.json.JSONObject
+
+@Composable
+internal fun SusfsBasicPage(config: JSONObject?, status: SusfsStatus, writable: Boolean, vm: SusfsViewModel) {
+    var selected by remember { mutableStateOf<String?>(null) }
+    val options = listOf(
+        Triple("hide_mounts", R.string.susfs_hide_mounts, status.capabilities.hideMounts),
+        Triple("logging", R.string.susfs_logging, status.capabilities.logging),
+        Triple("avc_spoof", R.string.susfs_avc, status.capabilities.avcSpoof),
+    )
+    SegmentedColumn(title = stringResource(R.string.susfs_settings)) {
+        options.forEach { (key, title, supported) -> item(key = key) {
+            val settings = config?.optJSONObject("settings")
+            val mode = if (settings == null || settings.isNull(key)) 0 else if (settings.optBoolean(key)) 1 else 2
+            val managed = mode != 0
+            SegmentedListItem(enabled = writable && (supported || managed), onClick = { selected = key },
+                headlineContent = { Text(stringResource(title)) },
+                supportingContent = { Text(susfsDisabledReason(status, supported, writable) ?: stringResource(R.string.susfs_three_state_hint)) },
+                trailingContent = { Text(stringResource(listOf(R.string.susfs_unmanaged, R.string.susfs_on, R.string.susfs_off)[mode]),
+                    color = MaterialTheme.colorScheme.primary) })
+        } }
+    }
+    selected?.let { key ->
+        val option = options.first { it.first == key }
+        val settings = config?.optJSONObject("settings")
+        val current = if (settings == null || settings.isNull(key)) 0 else if (settings.optBoolean(key)) 1 else 2
+        SusfsChoiceDialog(stringResource(option.second), listOf(R.string.susfs_unmanaged, R.string.susfs_on, R.string.susfs_off),
+            current, writable && (option.third || current != 0), { selected = null }) { index ->
+            vm.change { it.getJSONObject("settings").put(key, when (index) { 1 -> true; 2 -> false; else -> JSONObject.NULL }) }
+            selected = null
+        }
+    }
+}
+
+@Composable
+internal fun SusfsUnameSection(
+    config: JSONObject?,
+    status: SusfsStatus,
+    writable: Boolean,
+    kernelFacts: KernelFacts?,
+    kernelFactsLoading: Boolean,
+    kernelFactsError: String?,
+    vm: SusfsViewModel,
+) {
+    var editing by remember { mutableStateOf(false) }
+    val uname = config?.optJSONObject("settings")?.optJSONObject("uname")
+    val supported = status.capabilities.uname
+    SegmentedColumn(title = stringResource(R.string.susfs_uname)) {
+        item { SegmentedListItem(enabled = writable && supported, onClick = { editing = true },
+            headlineContent = { Text(stringResource(R.string.susfs_uname)) },
+            supportingContent = { Text(susfsDisabledReason(status, supported, writable) ?: if (uname == null)
+                stringResource(R.string.susfs_unmanaged) else
+                "${stringResource(R.string.susfs_release)}: ${uname.optString("release")}\n${stringResource(R.string.susfs_version)}: ${uname.optString("version")}") },
+            leadingContent = { Icon(Icons.Rounded.Tune, null) }) }
+        item { SegmentedListItem(enabled = writable && supported, onClick = {
+            vm.change { it.getJSONObject("settings").put("uname", JSONObject().put("release", "default").put("version", "default")) }
+        }, headlineContent = { Text(stringResource(R.string.susfs_restore_uname)) },
+            supportingContent = { Text(stringResource(R.string.susfs_restore_hint)) }) }
+    }
+    if (editing) {
+        var release by remember { mutableStateOf(uname?.optString("release") ?: "default") }
+        var version by remember { mutableStateOf(uname?.optString("version") ?: "default") }
+        var draftSourceSlot by remember { mutableStateOf<String?>(null) }
+        var draftSourceIdentity by remember { mutableStateOf<String?>(null) }
+        var tab by remember { mutableIntStateOf(0) }
+        val valid = SusfsInputs.validText(release, 65) && SusfsInputs.validText(version, 65)
+        SusfsForm(stringResource(R.string.susfs_uname), { editing = false }, writable && valid, {
+            vm.change { it.getJSONObject("settings").put("uname", JSONObject().put("release", release).put("version", version)) }
+            editing = false
+        }) {
+            ExpressiveTabRow(
+                selectedTabIndex = tab,
+                tabs = listOf(
+                    stringResource(R.string.susfs_editor_manual),
+                    stringResource(R.string.susfs_editor_slot),
+                ),
+                onTabClick = { tab = it },
+            )
+            when (tab) {
+                0 -> {
+                    Text(stringResource(R.string.susfs_uname_hint), style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(release, {
+                        release = it
+                        draftSourceSlot = null
+                        draftSourceIdentity = null
+                    }, label = { Text(stringResource(R.string.susfs_release)) },
+                        modifier = Modifier.fillMaxWidth(), singleLine = true,
+                        isError = !SusfsInputs.validText(release, 65))
+                    OutlinedTextField(version, {
+                        version = it
+                        draftSourceSlot = null
+                        draftSourceIdentity = null
+                    }, label = { Text(stringResource(R.string.susfs_version)) },
+                        modifier = Modifier.fillMaxWidth(), singleLine = true,
+                        isError = !SusfsInputs.validText(version, 65))
+                    if (!valid) {
+                        Text(stringResource(R.string.susfs_uname_invalid), color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                else -> BootSlotSource(
+                    facts = kernelFacts,
+                    loading = kernelFactsLoading,
+                    error = kernelFactsError,
+                    onRefresh = vm::refresh,
+                    onUseKernel = { slot ->
+                        release = slot.release!!.value
+                        version = slot.version!!.value
+                        draftSourceSlot = slot.id
+                        draftSourceIdentity = slot.sourceIdentity
+                        tab = 0
+                    },
+                    draftSourceSlot = draftSourceSlot,
+                    draftSourceIdentity = draftSourceIdentity,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+internal fun SusfsCmdlineSection(
+    config: JSONObject?,
+    status: SusfsStatus,
+    writable: Boolean,
+    kernelFacts: KernelFacts?,
+    kernelFactsLoading: Boolean,
+    kernelFactsError: String?,
+    vm: SusfsViewModel,
+) {
+    var editing by remember { mutableStateOf(false) }
+    val settings = config?.optJSONObject("settings")
+    val value = if (settings == null || settings.isNull("cmdline")) "" else settings.optString("cmdline")
+    val managed = settings != null && !settings.isNull("cmdline")
+    val supported = status.capabilities.cmdline
+    SegmentedColumn(title = stringResource(R.string.susfs_cmdline)) {
+        item { SegmentedListItem(enabled = writable && supported, onClick = { editing = true },
+            headlineContent = { Text(stringResource(R.string.susfs_cmdline)) },
+            supportingContent = { Text(susfsDisabledReason(status, supported, writable) ?: when {
+                !managed -> stringResource(R.string.susfs_unmanaged)
+                value.isEmpty() -> stringResource(R.string.susfs_restore_cmdline)
+                else -> value
+            }) }) }
+        item { SegmentedListItem(enabled = writable && supported, onClick = {
+            vm.change { it.getJSONObject("settings").put("cmdline", "") }
+        }, headlineContent = { Text(stringResource(R.string.susfs_restore_cmdline)) },
+            supportingContent = { Text(stringResource(R.string.susfs_restore_cmdline_hint)) }) }
+    }
+    if (editing) {
+        var text by remember { mutableStateOf(value) }
+        var draftSourceSlot by remember { mutableStateOf<String?>(null) }
+        var draftSourceIdentity by remember { mutableStateOf<String?>(null) }
+        var tab by remember { mutableIntStateOf(0) }
+        val valid = SusfsInputs.validCmdline(text)
+        SusfsForm(stringResource(R.string.susfs_cmdline), { editing = false }, writable && valid, {
+            vm.change { it.getJSONObject("settings").put("cmdline", text) }; editing = false
+        }) {
+            ExpressiveTabRow(
+                selectedTabIndex = tab,
+                tabs = listOf(
+                    stringResource(R.string.susfs_editor_manual),
+                    stringResource(R.string.susfs_editor_presets),
+                ),
+                onTabClick = { tab = it },
+            )
+            when (tab) {
+                0 -> {
+                    Text(stringResource(R.string.susfs_cmdline_hint), style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(text, {
+                        text = it
+                        draftSourceSlot = null
+                        draftSourceIdentity = null
+                    }, modifier = Modifier.fillMaxWidth(), minLines = 3,
+                        label = { Text(stringResource(R.string.susfs_cmdline)) }, isError = !valid)
+                    if (!valid) {
+                        Text(stringResource(R.string.susfs_text_invalid), color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                else -> BootSlotSource(
+                    facts = kernelFacts,
+                    loading = kernelFactsLoading,
+                    error = kernelFactsError,
+                    onRefresh = vm::refresh,
+                    onUseCmdline = { slotId, source ->
+                        text = source.value
+                        draftSourceSlot = slotId
+                        draftSourceIdentity = kernelFacts?.slot(slotId)?.sourceIdentity
+                        tab = 0
+                    },
+                    onUseBootconfig = { slotId, source ->
+                        text = source.value
+                        draftSourceSlot = slotId
+                        draftSourceIdentity = kernelFacts?.slot(slotId)?.sourceIdentity
+                        tab = 0
+                    },
+                    draftSourceSlot = draftSourceSlot,
+                    draftSourceIdentity = draftSourceIdentity,
+                )
+            }
+        }
+    }
+}
+
+private fun ruleTitle(kind: String) = when (kind) {
+    "path" -> R.string.susfs_path_rules
+    "map" -> R.string.susfs_map_rules
+    "kstat" -> R.string.susfs_kstat_rules
+    else -> R.string.susfs_redirect_rules
+}
+
+@Composable
+internal fun SusfsRuleSection(kind: String, config: JSONObject?, status: SusfsStatus, writable: Boolean, vm: SusfsViewModel) {
+    var editing by remember { mutableStateOf(false) }
+    var original by remember { mutableStateOf<String?>(null) }
+    var deleting by remember { mutableStateOf<String?>(null) }
+    var editingStatic by remember { mutableStateOf(false) }
+    var batchAdding by remember { mutableStateOf(false) }
+    val supported = when (kind) {
+        "path" -> status.capabilities.path
+        "map" -> status.capabilities.map
+        "kstat" -> status.capabilities.dynamicKstat
+        else -> status.capabilities.redirect
+    }
+    val hint = when (kind) { "path" -> R.string.susfs_path_hint; "map" -> R.string.susfs_map_hint
+        "kstat" -> R.string.susfs_kstat_hint; else -> R.string.susfs_redirect_hint }
+    val rules = config?.optJSONArray("rules") ?: JSONArray()
+    val entries = (0 until rules.length()).map { rules.getJSONObject(it) }.filter {
+        it.getString("kind") == kind || (kind == "kstat" && it.getString("kind") == "static_kstat")
+    }
+    SegmentedColumn(title = stringResource(ruleTitle(kind))) {
+        if (kind == "kstat") item { SegmentedListItem(
+            enabled = writable && status.capabilities.staticKstat,
+            onClick = { original = null; editingStatic = true },
+            headlineContent = { Text(stringResource(R.string.susfs_static_add)) },
+            supportingContent = { Text(stringResource(if (status.capabilities.staticKstat) R.string.susfs_static_hint else R.string.susfs_static_unsupported)) },
+            leadingContent = { Icon(Icons.Rounded.Add, null) },
+        ) }
+        item { SegmentedListItem(enabled = writable && supported, onClick = { original = null; editing = true },
+            headlineContent = { Text(stringResource(R.string.susfs_add_rule)) },
+            supportingContent = { Text(susfsDisabledReason(status, supported, writable) ?: stringResource(hint)) },
+            leadingContent = { Icon(Icons.Rounded.Add, null) }) }
+        if (kind != "kstat") item { SegmentedListItem(enabled = writable && supported, onClick = { batchAdding = true },
+            headlineContent = { Text(stringResource(R.string.susfs_batch_add)) },
+            supportingContent = { Text(susfsDisabledReason(status, supported, writable) ?: stringResource(
+                if (kind == "redirect") R.string.susfs_batch_redirect_hint else R.string.susfs_batch_hint)) },
+            leadingContent = { Icon(Icons.AutoMirrored.Rounded.PlaylistAdd, null) }) }
+        entries.forEach { rule -> item(key = rule.getString("path")) {
+            SegmentedListItem(enabled = writable && supported && (rule.getString("kind") != "static_kstat" ||
+                (status.capabilities.staticKstat && rule.getJSONObject("fields").keys().asSequence().all {
+                    it in status.capabilities.staticKstatFields || rule.getJSONObject("fields").isNull(it)
+                })), onClick = {
+                original = rule.toString(); if (rule.getString("kind") == "static_kstat") editingStatic = true else editing = true
+            },
+                headlineContent = { Text(rule.getString("path")) },
+                supportingContent = { Text(when (kind) {
+                    "path" -> stringResource(if (rule.optBoolean("looping")) R.string.susfs_loop else R.string.susfs_path_once)
+                    "map" -> stringResource(R.string.susfs_map_hint)
+                    "kstat" -> if (rule.getString("kind") == "static_kstat") stringResource(R.string.susfs_static_title)
+                        else stringResource(if (rule.optBoolean("full_clone")) R.string.susfs_clone else R.string.susfs_kstat_normal)
+                    else -> "→ ${rule.getString("destination")}\n${susfsUidLabel(rule.optInt("uid_scheme"))}"
+                }) }, leadingContent = { Icon(when (kind) { "path" -> Icons.Rounded.FolderOff
+                    "map" -> Icons.Rounded.Memory; "kstat" -> Icons.Rounded.DataObject; else -> Icons.AutoMirrored.Rounded.AltRoute }, null) },
+                trailingContent = { TextButton(enabled = writable, onClick = { deleting = rule.toString() }) { Text(stringResource(R.string.susfs_remove)) } })
+        } }
+        if (entries.isEmpty()) item { SegmentedListItem(headlineContent = { Text(stringResource(R.string.susfs_empty)) }) }
+    }
+    if (entries.isNotEmpty()) Text(stringResource(R.string.susfs_removal_hint), style = MaterialTheme.typography.bodySmall)
+    if (editing) SusfsRuleDialog(kind, original, status, writable && supported, { editing = false }) { replacement ->
+        val expected = original
+        vm.change { SusfsInputs.replaceRule(it, expected, replacement) }
+        editing = false
+    }
+    if (editingStatic) SusfsStaticKstatDialog(original, status, writable && status.capabilities.staticKstat,
+        { editingStatic = false }) { replacement ->
+        val expected = original
+        vm.change {
+            it.put("schema", 2)
+            SusfsInputs.replaceRule(it, expected, replacement)
+        }
+        editingStatic = false
+    }
+    if (batchAdding) SusfsBatchRuleDialog(kind, status.capabilities.redirectUidSchemes,
+        writable && supported, { batchAdding = false }) { additions ->
+        vm.change { SusfsInputs.addRules(it, additions) }
+        batchAdding = false
+    }
+    deleting?.let { text -> SusfsDeleteDialog(JSONObject(text).getString("path"), writable, { deleting = null }) {
+        vm.change { SusfsInputs.replaceRule(it, text, null) }; deleting = null
+    } }
+}
+
+@Composable
+private fun SusfsBatchRuleDialog(kind: String, schemes: List<Int>, writable: Boolean,
+    dismiss: () -> Unit, save: (List<JSONObject>) -> Unit) {
+    var text by remember { mutableStateOf("") }
+    var uid by remember { mutableIntStateOf(0) }
+    var looping by remember { mutableStateOf(false) }
+    val parsed = remember(kind, text, uid, looping) {
+        runCatching { SusfsInputs.batchRules(kind, text, uid, looping, schemes.toSet()) }
+    }
+    SusfsForm(stringResource(R.string.susfs_batch_add), dismiss, writable && parsed.isSuccess, {
+        save(parsed.getOrThrow())
+    }) {
+        Text(stringResource(if (kind == "redirect") R.string.susfs_batch_redirect_hint else R.string.susfs_batch_hint))
+        OutlinedTextField(text, { text = it }, modifier = Modifier.fillMaxWidth(), minLines = 5,
+            label = { Text(stringResource(R.string.susfs_batch_input)) },
+            placeholder = { Text(if (kind == "redirect") "/source -> /destination\n/source2 -> /destination2"
+                else "/data/local/tmp/example\n/system/example") })
+        if (kind == "redirect") {
+            Text(stringResource(R.string.susfs_uid_selection), style = MaterialTheme.typography.titleSmall)
+            SegmentedColumn { schemes.forEach { value -> item {
+                SegmentedListItem(selected = uid == value, onClick = { uid = value },
+                    headlineContent = { Text(susfsUidLabel(value)) }, trailingContent = { RadioButton(uid == value, null) })
+            } } }
+        }
+        if (kind == "path") {
+            SegmentedColumn { item { SegmentedSwitchItem(title = stringResource(R.string.susfs_loop),
+                summary = stringResource(R.string.susfs_loop_hint), checked = looping, onCheckedChange = { looping = it }) } }
+        }
+        parsed.fold(
+            onSuccess = { Text(stringResource(R.string.susfs_batch_count, it.size)) },
+            onFailure = {
+                val detail = it.message.orEmpty()
+                Text(if (text.isBlank()) stringResource(R.string.susfs_batch_empty)
+                    else stringResource(R.string.susfs_batch_invalid, detail),
+                    color = MaterialTheme.colorScheme.error)
+            },
+        )
+        Text(stringResource(R.string.susfs_removal_hint), style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun SusfsStaticKstatDialog(original: String?, status: SusfsStatus, writable: Boolean,
+    dismiss: () -> Unit, save: (JSONObject) -> Unit) {
+    val rule = remember(original) { original?.let(::JSONObject) }
+    val fields = rule?.optJSONObject("fields")
+    var path by remember(original) { mutableStateOf(rule?.optString("path").orEmpty()) }
+    val supported = status.capabilities.staticKstatFields
+    val inputs = remember(original, supported) {
+        mutableStateMapOf<String, String>().apply {
+            supported.forEach { field ->
+                put(field, fields?.opt(field)?.takeUnless { it == JSONObject.NULL }?.toString().orEmpty())
+            }
+        }
+    }
+    val verifiedFields = susfsStaticFieldNames(supported)
+    val entered = inputs.filterValues(String::isNotBlank)
+    val valid = SusfsInputs.validPath(path) && entered.isNotEmpty() &&
+        entered.all { (field, value) -> SusfsInputs.validStaticKstatValue(field, value) }
+    SusfsForm(stringResource(R.string.susfs_static_title), dismiss, writable && valid, {
+        val values = JSONObject()
+        entered.forEach { (field, value) -> values.put(field, value.toLong()) }
+        save(JSONObject().put("kind", "static_kstat").put("path", path).put("fields", values))
+    }) {
+        Text(stringResource(R.string.susfs_static_hint))
+        OutlinedTextField(path, { path = it }, Modifier.fillMaxWidth(), singleLine = true, label = { Text(stringResource(R.string.susfs_path)) })
+        supported.forEach { field ->
+            OutlinedTextField(inputs[field].orEmpty(), { inputs[field] = it },
+                Modifier.fillMaxWidth(), singleLine = true,
+                label = { Text(staticKstatFieldLabel(field)) },
+                isError = inputs[field].orEmpty().isNotBlank() &&
+                    !SusfsInputs.validStaticKstatValue(field, inputs[field].orEmpty()))
+        }
+        Text(stringResource(R.string.susfs_static_verified_fields, verifiedFields))
+        Text(stringResource(R.string.susfs_removal_hint), style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun staticKstatFieldLabel(field: String): String = stringResource(when (field) {
+    "ino" -> R.string.susfs_static_ino
+    "dev" -> R.string.susfs_static_dev
+    "nlink" -> R.string.susfs_static_nlink
+    "size" -> R.string.susfs_static_size
+    "atime_sec" -> R.string.susfs_static_atime
+    "atime_nsec" -> R.string.susfs_static_atime_nsec
+    "mtime_sec" -> R.string.susfs_static_mtime
+    "mtime_nsec" -> R.string.susfs_static_mtime_nsec
+    "ctime_sec" -> R.string.susfs_static_ctime
+    "ctime_nsec" -> R.string.susfs_static_ctime_nsec
+    "blocks" -> R.string.susfs_static_blocks
+    else -> R.string.susfs_static_blksize
+})
+
+@Composable
+private fun susfsUidLabel(uid: Int): String = stringResource(when (uid) {
+    0 -> R.string.susfs_uid_non_app; 1 -> R.string.susfs_uid_root; 2 -> R.string.susfs_uid_non_su
+    3 -> R.string.susfs_uid_unmounted_app; 4 -> R.string.susfs_uid_unmounted
+    else -> R.string.susfs_uid_unsupported
+})
+
+@Composable
+private fun SusfsRuleDialog(kind: String, original: String?, status: SusfsStatus, writable: Boolean,
+    dismiss: () -> Unit, save: (JSONObject) -> Unit) {
+    val rule = remember(original) { original?.let(::JSONObject) }
+    var path by remember { mutableStateOf(rule?.optString("path").orEmpty()) }
+    var destination by remember { mutableStateOf(rule?.optString("destination").orEmpty()) }
+    var looping by remember { mutableStateOf(rule?.optBoolean("looping") ?: false) }
+    var clone by remember { mutableStateOf(rule?.optBoolean("full_clone") ?: false) }
+    var uid by remember { mutableIntStateOf(rule?.optInt("uid_scheme") ?: 0) }
+    val cloneSupported = status.capabilities.fullClone
+    val valid = SusfsInputs.validPath(path) && (kind != "redirect" ||
+        (SusfsInputs.validPath(destination) && destination != path &&
+            uid in status.capabilities.redirectUidSchemes)) &&
+        (kind != "kstat" || !clone || cloneSupported)
+    SusfsForm(stringResource(if (original == null) R.string.susfs_add_rule else R.string.susfs_edit_rule), dismiss, writable && valid, {
+        val result = JSONObject().put("kind", kind).put("path", path)
+        when (kind) { "path" -> result.put("looping", looping)
+            "kstat" -> result.put("full_clone", clone)
+            "redirect" -> result.put("destination", destination).put("uid_scheme", uid) }
+        save(result)
+    }) {
+        OutlinedTextField(path, { path = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
+            label = { Text(stringResource(R.string.susfs_path)) }, placeholder = { Text("/data/local/tmp/example") },
+            isError = path.isNotEmpty() && !SusfsInputs.validPath(path))
+        if (!SusfsInputs.validPath(path)) Text(stringResource(R.string.susfs_path_invalid), style = MaterialTheme.typography.bodySmall)
+        if (kind == "redirect") {
+            OutlinedTextField(destination, { destination = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
+                label = { Text(stringResource(R.string.susfs_destination)) }, isError = destination.isNotEmpty() &&
+                    (!SusfsInputs.validPath(destination) || destination == path))
+            Text(stringResource(R.string.susfs_uid_selection), style = MaterialTheme.typography.titleSmall)
+            SegmentedColumn { status.capabilities.redirectUidSchemes.forEach { value -> item {
+                SegmentedListItem(selected = uid == value, onClick = { uid = value },
+                    headlineContent = { Text(susfsUidLabel(value)) }, trailingContent = { RadioButton(uid == value, null) })
+            } } }
+            Text(stringResource(R.string.susfs_uid_hint), style = MaterialTheme.typography.bodySmall)
+        }
+        if (kind == "path") {
+            SegmentedColumn { item { SegmentedSwitchItem(title = stringResource(R.string.susfs_loop),
+                summary = stringResource(R.string.susfs_loop_hint), checked = looping, onCheckedChange = { looping = it }) } }
+        }
+        if (kind == "kstat") {
+            Text(stringResource(R.string.susfs_kstat_hint))
+            SegmentedColumn { item { SegmentedSwitchItem(title = stringResource(R.string.susfs_clone),
+                summary = stringResource(if (cloneSupported) R.string.susfs_clone_hint else R.string.susfs_proc_hint),
+                checked = clone, enabled = cloneSupported || clone, onCheckedChange = { clone = it && cloneSupported }) } }
+        }
+        if (kind == "map") Text(stringResource(R.string.susfs_map_hint))
+        Text(stringResource(R.string.susfs_removal_hint), style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+internal fun SusfsExtensionsPage(config: JSONObject?, status: SusfsStatus, writable: Boolean, vm: SusfsViewModel) {
+    if (status.implementation != "lkm") {
+        SegmentedColumn(title = stringResource(R.string.susfs_lkm)) { item { SegmentedListItem(
+            headlineContent = { Text(stringResource(R.string.susfs_lkm_only)) },
+            supportingContent = { Text(stringResource(R.string.susfs_lkm_only_hint)) }) } }
+        return
+    }
+    SusfsExtensionSection("hidden_modules", R.string.susfs_modules, config, status, writable, vm)
+    SusfsExtensionSection("mount_prefixes", R.string.susfs_prefixes, config, status, writable, vm)
+}
+
+@Composable
+private fun SusfsExtensionSection(key: String, title: Int, config: JSONObject?, status: SusfsStatus,
+    writable: Boolean, vm: SusfsViewModel) {
+    var adding by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf<String?>(null) }
+    val enabled = writable && if (key == "hidden_modules") status.capabilities.hiddenModules
+        else status.capabilities.mountPrefixes
+    val array = config?.optJSONObject("lkm")?.optJSONArray(key) ?: JSONArray()
+    SegmentedColumn(title = stringResource(title)) {
+        item { SegmentedListItem(enabled = enabled, onClick = { adding = true },
+            headlineContent = { Text(stringResource(R.string.susfs_add_entry)) },
+            supportingContent = { Text(susfsDisabledReason(status, enabled, writable) ?: stringResource(
+                if (key == "hidden_modules") R.string.susfs_module_hint else R.string.susfs_prefix_hint
+            )) },
+            leadingContent = { Icon(Icons.Rounded.Add, null) }) }
+        for (index in 0 until array.length()) item(key = array.getString(index)) {
+            val value = array.getString(index)
+            SegmentedListItem(headlineContent = { Text(value) }, trailingContent = {
+                TextButton(enabled = writable, onClick = { deleting = value }) { Text(stringResource(R.string.susfs_remove)) }
+            })
+        }
+        if (array.length() == 0) item { SegmentedListItem(headlineContent = { Text(stringResource(R.string.susfs_empty)) }) }
+    }
+    if (adding) {
+        var value by remember { mutableStateOf("") }
+        val valid = if (key == "hidden_modules") value.length in 1..63 && value.all {
+            it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '_'
+        } else SusfsInputs.validPath(value)
+        SusfsForm(stringResource(title), { adding = false }, enabled && valid, {
+            vm.change {
+                val current = it.getJSONObject("lkm").getJSONArray(key)
+                require((0 until current.length()).none { index -> current.getString(index) == value }) { "Duplicate entry" }
+                current.put(value)
+            }; adding = false
+        }) {
+            OutlinedTextField(value, { value = it }, label = { Text(stringResource(title)) }, singleLine = true,
+                modifier = Modifier.fillMaxWidth(), isError = value.isNotEmpty() && !valid)
+            Text(stringResource(if (key == "hidden_modules") R.string.susfs_module_hint else R.string.susfs_path_invalid))
+        }
+    }
+    deleting?.let { value -> SusfsDeleteDialog(value, writable, { deleting = null }) {
+        vm.change {
+            val current = it.getJSONObject("lkm").getJSONArray(key)
+            val index = (0 until current.length()).firstOrNull { index -> current.getString(index) == value }
+                ?: error("Entry changed elsewhere; refresh before editing")
+            current.remove(index)
+        }; deleting = null
+    } }
+}
+
+@Composable
+private fun SusfsChoiceDialog(title: String, choices: List<Int>, selected: Int, enabled: Boolean,
+    dismiss: () -> Unit, choose: (Int) -> Unit) {
+    AlertDialog(onDismissRequest = dismiss, title = { Text(title) }, text = {
+        SegmentedColumn { choices.forEachIndexed { index, label -> item {
+            SegmentedListItem(selected = selected == index, enabled = enabled, onClick = { choose(index) },
+                headlineContent = { Text(stringResource(label)) }, trailingContent = { RadioButton(selected == index, null, enabled = enabled) })
+        } } }
+    }, confirmButton = { TextButton(onClick = dismiss) { Text(stringResource(R.string.susfs_cancel)) } })
+}
+
+@Composable
+private fun SusfsDeleteDialog(value: String, enabled: Boolean, dismiss: () -> Unit, delete: () -> Unit) {
+    AlertDialog(onDismissRequest = dismiss, title = { Text(stringResource(R.string.susfs_remove)) },
+        text = { Text("$value\n\n${stringResource(R.string.susfs_removal_hint)}") },
+        confirmButton = { TextButton(enabled = enabled, onClick = delete) { Text(stringResource(R.string.susfs_remove)) } },
+        dismissButton = { TextButton(onClick = dismiss) { Text(stringResource(R.string.susfs_cancel)) } })
+}
+
+@Composable
+private fun SusfsForm(title: String, dismiss: () -> Unit, valid: Boolean, save: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+    AlertDialog(onDismissRequest = dismiss, title = { Text(title) }, text = {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
+    }, confirmButton = { TextButton(enabled = valid, onClick = save) { Text(stringResource(R.string.susfs_save)) } },
+        dismissButton = { TextButton(onClick = dismiss) { Text(stringResource(R.string.susfs_cancel)) } })
+}

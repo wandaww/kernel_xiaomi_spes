@@ -1,0 +1,16 @@
+.idea
+.vscode
+CLAUDE.md
+AGENTS.md
+.DS_Store
+/target
+.cargo/config.toml
+__pycache__
+/dist
+/repack-config.json
+/userspace/ksud/.lkm_image_bootstrap.o
+/.research
+/design
+/userspace/ksud/bin/*/mkbootfs
+/userspace/ksud/bin/*/folkzygisk/
+/userspace/ksud/bin/*/sui/

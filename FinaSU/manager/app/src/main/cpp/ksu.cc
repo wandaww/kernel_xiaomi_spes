@@ -1,0 +1,362 @@
+//
+// Created by weishu on 2022/12/9.
+//
+
+#include <sys/prctl.h>
+#include <ctime>
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <unistd.h>
+#include <utility>
+#include <android/log.h>
+#include <dirent.h>
+#include <cstdlib>
+#include <string>
+
+#include <unistd.h>
+#include <climits>
+#include <atomic>
+#include <mutex>
+#include <sys/syscall.h>
+#include <cerrno>
+#include <cstddef>
+#include "ksu.h"
+
+static_assert(sizeof(ksu_lookup_symbols_cmd) == 24);
+static_assert(alignof(ksu_lookup_symbols_cmd) == 8);
+static_assert(offsetof(ksu_lookup_symbols_cmd, names) == 0);
+static_assert(offsetof(ksu_lookup_symbols_cmd, addrs) == 8);
+static_assert(offsetof(ksu_lookup_symbols_cmd, count) == 16);
+static_assert(offsetof(ksu_lookup_symbols_cmd, flags) == 20);
+static_assert(KSU_IOCTL_LOOKUP_SYMBOLS != KSU_IOCTL_SET_DYNAMIC_MANAGERS);
+
+static std::atomic<int> fd{-1};
+static std::mutex g_fd_mutex;
+
+static inline int scan_driver_fd() {
+    const char *kName = "[ksu_driver]";
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) {
+        return -1;
+    }
+
+    int found = -1;
+    struct dirent *de;
+    char path[64];
+    char target[PATH_MAX];
+
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') {
+            continue;
+        }
+
+        char *endptr = NULL;
+        long fd_long = strtol(de->d_name, &endptr, 10);
+        if (!de->d_name[0] || *endptr != '\0' || fd_long < 0 || fd_long > INT_MAX) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "/proc/self/fd/%s", de->d_name);
+        ssize_t n = readlink(path, target, sizeof(target) - 1);
+        if (n < 0) {
+            continue;
+        }
+        target[n] = '\0';
+
+        const char *base = strrchr(target, '/');
+        base = base ? base + 1 : target;
+
+        if (strstr(base, kName)) {
+            found = (int)fd_long;
+            break;
+        }
+    }
+
+    closedir(dir);
+    return found;
+}
+
+template<typename... Args>
+static int ksuctl(unsigned long op, Args &&... args) {
+
+    int local_fd = fd.load(std::memory_order_acquire);
+    if (local_fd < 0) {
+        std::lock_guard<std::mutex> lock(g_fd_mutex);
+        if (fd.load(std::memory_order_relaxed) < 0) {
+            fd.store(scan_driver_fd(), std::memory_order_release);
+        }
+        local_fd = fd.load(std::memory_order_relaxed);
+    }
+
+    static_assert(sizeof...(Args) <= 1, "ioctl expects at most one extra argument");
+
+    return ioctl(local_fd, op, std::forward<Args>(args)...);
+}
+
+static struct ksu_get_info_cmd g_version {};
+static bool g_version_valid = false;
+static int64_t g_version_at_ms = 0;
+
+// get_info() is called from several threads (Compose recomposition, background probes), so the
+// cache is guarded. The TTL is a *staleness bound for incidental reads*, not a state-update
+// mechanism: identity revocation must be observed via an explicit refresh (see refresh_info()).
+static std::mutex g_info_mutex;
+
+// The MANAGER flag and the dynamic-manager version are mutable: a manager can be
+// authorized or revoked while this process runs. A cached answer must therefore
+// expire, or a revoked identity would stay "manager" forever. Stable fields
+// (kernel version, UAPI, feature mask) ride along in the same short-lived cache.
+static constexpr int64_t INFO_CACHE_TTL_MS = 1000;
+
+static int64_t now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Re-queries the kernel and replaces the cache. Caller must hold g_info_mutex.
+static void query_info_locked() {
+    struct ksu_get_info_cmd info {};
+    if (ksuctl(KSU_IOCTL_GET_INFO, &info) == 0) {
+        g_version = info;
+    } else {
+        ksuctl(KSU_IOCTL_GET_INFO_LEGACY, &info);
+        info.uapi_version = 0;
+        g_version = info;
+    }
+    g_version_valid = true;
+    g_version_at_ms = now_ms();
+}
+
+struct ksu_get_info_cmd get_info() {
+    std::lock_guard<std::mutex> lock(g_info_mutex);
+    if (!g_version_valid || now_ms() - g_version_at_ms >= INFO_CACHE_TTL_MS) {
+        query_info_locked();
+    }
+    return g_version;
+}
+
+// Explicitly invalidate and re-read, so a caller that must observe a just-changed identity
+// (grant/revoke) is not served the TTL cache.
+struct ksu_get_info_cmd refresh_info() {
+    std::lock_guard<std::mutex> lock(g_info_mutex);
+    query_info_locked();
+    return g_version;
+}
+
+uint32_t get_kernel_uapi_version() {
+    auto info = get_info();
+    return info.uapi_version;
+}
+
+uint32_t get_manager_uapi_version() {
+    return KERNEL_SU_UAPI_VERSION;
+}
+
+uint32_t get_kernel_hook_flags() {
+    return get_info().flags & (KSU_GET_INFO_FLAG_HOOK_TRACEPOINT | KSU_GET_INFO_FLAG_HOOK_SUSFS_INLINE |
+                               KSU_GET_INFO_FLAG_HOOK_READY);
+}
+
+std::string get_full_version() {
+    struct ksu_get_full_version_cmd cmd = {};
+    if (ksuctl(KSU_IOCTL_GET_FULL_VERSION, &cmd) != 0) {
+        return {};
+    }
+    cmd.version_full[sizeof(cmd.version_full) - 1] = '\0';
+    return std::string(cmd.version_full);
+}
+
+uint32_t get_version() {
+    auto info = get_info();
+    return info.version;
+}
+
+bool get_allow_list(struct ksu_new_get_allow_list_cmd *cmd) {
+    return ksuctl(KSU_IOCTL_NEW_GET_ALLOW_LIST, cmd) == 0;
+}
+
+uint32_t get_dynamic_managers(struct ksu_dynamic_manager_app *apps, uint32_t max_count,
+                              uint32_t *total_count) {
+    struct ksu_get_dynamic_managers_cmd cmd = {};
+    cmd.count = max_count;
+    cmd.apps = (uintptr_t) apps;
+    if (ksuctl(KSU_IOCTL_GET_DYNAMIC_MANAGERS, &cmd) == 0) {
+        if (total_count) *total_count = cmd.total_count;
+        return cmd.count;
+    }
+    if (total_count) *total_count = 0;
+    return 0;
+}
+
+bool is_safe_mode() {
+    struct ksu_check_safemode_cmd cmd = {};
+    ksuctl(KSU_IOCTL_CHECK_SAFEMODE, &cmd);
+    return cmd.in_safe_mode;
+}
+
+bool is_lkm_mode() {
+    auto info = get_info();
+    if (info.version > 0) {
+        return (info.flags & KSU_GET_INFO_FLAG_LKM) != 0;
+    }
+    return (legacy_get_info().second & KSU_GET_INFO_FLAG_LKM) != 0;
+}
+
+bool is_lkm_bundled() {
+    auto info = get_info();
+    return (info.flags & KSU_GET_INFO_FLAG_LKM) != 0 &&
+           (info.flags & KSU_GET_INFO_FLAG_BUNDLED) != 0;
+}
+
+bool is_late_load_mode() {
+    auto info = get_info();
+    if (info.version > 0) {
+        return (info.flags & KSU_GET_INFO_FLAG_LATE_LOAD) != 0;
+    }
+    return false;
+}
+
+bool is_manager() {
+    auto info = get_info();
+    if (info.version > 0) {
+        return (info.flags & KSU_GET_INFO_FLAG_MANAGER) != 0;
+    }
+    return legacy_get_info().first > 0;
+}
+
+bool is_pr_build() {
+    auto info = get_info();
+    if (info.version > 0) {
+        return (info.flags & KSU_GET_INFO_FLAG_PR_BUILD) != 0;
+    }
+    return false;
+}
+
+bool uid_should_umount(int uid) {
+    struct ksu_uid_should_umount_cmd cmd = {};
+    cmd.uid = uid;
+    ksuctl(KSU_IOCTL_UID_SHOULD_UMOUNT, &cmd);
+    return cmd.should_umount;
+}
+
+bool set_app_profile(const app_profile *profile) {
+    struct ksu_set_app_profile_cmd cmd = {};
+    cmd.profile = *profile;
+    return ksuctl(KSU_IOCTL_SET_APP_PROFILE, &cmd) == 0;
+}
+
+int get_app_profile(app_profile *profile) {
+    struct ksu_get_app_profile_cmd cmd = {.profile = *profile};
+    int ret = ksuctl(KSU_IOCTL_GET_APP_PROFILE, &cmd);
+    *profile = cmd.profile;
+    return ret;
+}
+
+bool set_su_enabled(bool enabled) {
+    struct ksu_set_feature_cmd cmd = {};
+    cmd.feature_id = KSU_FEATURE_SU_COMPAT;
+    cmd.value = enabled ? 1 : 0;
+    return ksuctl(KSU_IOCTL_SET_FEATURE, &cmd) == 0;
+}
+
+bool is_su_enabled() {
+    struct ksu_get_feature_cmd cmd = {};
+    cmd.feature_id = KSU_FEATURE_SU_COMPAT;
+    if (ksuctl(KSU_IOCTL_GET_FEATURE, &cmd) != 0) {
+        return false;
+    }
+    if (!(cmd.supported & KSU_FEATURE_FLAG_SUPPORTED)) {
+        return false;
+    }
+    return cmd.value != 0;
+}
+
+static inline bool get_feature(uint32_t feature_id, uint64_t *out_value, bool *out_supported) {
+    struct ksu_get_feature_cmd cmd = {};
+    cmd.feature_id = feature_id;
+    if (ksuctl(KSU_IOCTL_GET_FEATURE, &cmd) != 0) {
+        return false;
+    }
+    if (out_value) *out_value = cmd.value;
+    if (out_supported) *out_supported = cmd.supported & KSU_FEATURE_FLAG_SUPPORTED;
+    return true;
+}
+
+static inline bool set_feature(uint32_t feature_id, uint64_t value) {
+    struct ksu_set_feature_cmd cmd = {};
+    cmd.feature_id = feature_id;
+    cmd.value = value;
+    return ksuctl(KSU_IOCTL_SET_FEATURE, &cmd) == 0;
+}
+
+bool set_kernel_umount_enabled(bool enabled) {
+    return set_feature(KSU_FEATURE_KERNEL_UMOUNT, enabled ? 1 : 0);
+}
+
+bool is_kernel_umount_enabled() {
+    uint64_t value = 0;
+    bool supported = false;
+    if (!get_feature(KSU_FEATURE_KERNEL_UMOUNT, &value, &supported)) {
+        return false;
+    }
+    if (!supported) {
+        return false;
+    }
+    return value != 0;
+}
+
+int set_selinux_hide_enabled(bool enabled) {
+    if (!set_feature(KSU_FEATURE_SELINUX_HIDE, enabled ? 1 : 0)) {
+        return -errno;
+    }
+    return 0;
+}
+
+bool is_selinux_hide_enabled() {
+    uint64_t value = 0;
+    bool supported = false;
+    if (!get_feature(KSU_FEATURE_SELINUX_HIDE, &value, &supported)) {
+        return false;
+    }
+    if (!supported) {
+        return false;
+    }
+    return value != 0;
+}
+
+bool is_avc_spoof_enabled() {
+    uint64_t value = 0;
+    bool supported = false;
+    return get_feature(KSU_FEATURE_AVC_SPOOF, &value, &supported) && supported && value != 0;
+}
+
+bool set_avc_spoof_enabled(bool enabled) {
+    return set_feature(KSU_FEATURE_AVC_SPOOF, enabled ? 1 : 0);
+}
+
+// Dynamic-manager support is advertised by KSU_FEATURE_DYNAMIC_MANAGER, not
+// by the UAPI version: the commands are additive, so a kernel that merely
+// shares uapi 5 is not guaranteed to implement them. Feature detection is
+// the only reliable probe.
+bool is_dynamic_manager_enabled() {
+    uint64_t value = 0;
+    bool supported = false;
+    if (!get_feature(KSU_FEATURE_DYNAMIC_MANAGER, &value, &supported)) {
+        return false;
+    }
+    return supported;
+}
+
+// The authorized-appid list is advertised separately from the dynamic-manager
+// capability itself: a kernel that only knows the signature list reports the old
+// feature, and the UI then falls back to "trusted == dynamic manager".
+bool is_dynamic_manager_grants_enabled() {
+    uint64_t value = 0;
+    bool supported = false;
+    if (!get_feature(KSU_FEATURE_DYNAMIC_MANAGER_GRANTS, &value, &supported)) {
+        return false;
+    }
+    return supported;
+}
